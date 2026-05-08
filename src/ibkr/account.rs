@@ -1,4 +1,6 @@
-
+use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
+use ibapi::accounts::types::AccountGroup;
+use tokio::time::{timeout, Duration};
 use std::sync::Arc;
 use tracing::info;
 
@@ -49,9 +51,6 @@ impl AccountManager {
         info!("Listing managed accounts");
 
         // TODO: Implement using ibapi v3 API
-        // In ibapi v3, managed accounts come from the connection handshake
-        // or can be requested explicitly
-
         Err(IbkrError::Unknown(
             "List accounts not yet implemented".to_string(),
         ))
@@ -62,19 +61,82 @@ impl AccountManager {
         &self,
         account_id: Option<&str>,
     ) -> Result<AccountInfo, IbkrError> {
-        let _client = self.client.get_client().await?;
+        let client = self.client.get_client().await?;
+        let target_account = account_id.map(|s| s.to_string());
 
         info!(
             account_id = account_id.unwrap_or("default"),
             "Fetching account info"
         );
 
-        // TODO: Implement using ibapi v3's account_summary or account_updates
-        // This requires subscribing to account updates and collecting values
+        let tags = &[
+            AccountSummaryTags::NET_LIQUIDATION,
+            AccountSummaryTags::AVAILABLE_FUNDS,
+            AccountSummaryTags::BUYING_POWER,
+            AccountSummaryTags::TOTAL_CASH_VALUE,
+            AccountSummaryTags::GROSS_POSITION_VALUE,
+            AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
+        ];
 
-        Err(IbkrError::Unknown(
-            "Get account info not yet implemented".to_string(),
-        ))
+        let mut subscription = client
+            .account_summary(&AccountGroup("All".to_string()), tags)
+            .await
+            .map_err(|e| IbkrError::Unknown(format!("account_summary failed: {e}")))?;
+
+        let mut values: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+
+        let collect_timeout = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < collect_timeout {
+            match timeout(Duration::from_millis(500), subscription.next_data()).await {
+                Ok(Some(Ok(AccountSummaryResult::Summary(summary)))) => {
+                    if target_account.is_none()
+                        || target_account.as_ref() == Some(&summary.account)
+                    {
+                        values.insert(
+                            summary.tag.clone(),
+                            (summary.value.clone(), summary.currency.clone()),
+                        );
+                    }
+                }
+                Ok(Some(Ok(AccountSummaryResult::End))) => break,
+                Ok(Some(Err(e))) => {
+                    return Err(IbkrError::Unknown(format!(
+                        "account_summary stream error: {e}"
+                    )));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if !values.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if values.is_empty() {
+            return Err(IbkrError::Unknown(
+                "No account summary data received".to_string(),
+            ));
+        }
+
+        let get = |tag: &str| values.get(tag).map(|(v, _)| v.clone()).unwrap_or_default();
+
+        let account_id = target_account
+            .unwrap_or_else(|| values.values().next().map(|(v, _)| v.clone()).unwrap_or_default());
+
+        Ok(AccountInfo {
+            account_id,
+            net_liquidation: parse_f64(&get(AccountSummaryTags::NET_LIQUIDATION)),
+            available_funds: parse_f64(&get(AccountSummaryTags::AVAILABLE_FUNDS)),
+            buying_power: parse_f64(&get(AccountSummaryTags::BUYING_POWER)),
+            currency: "USD".to_string(),
+            daily_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            realized_pnl: 0.0,
+        })
     }
 
     /// Get current positions
@@ -82,18 +144,60 @@ impl AccountManager {
         &self,
         account_id: Option<&str>,
     ) -> Result<Vec<Position>, IbkrError> {
-        let _client = self.client.get_client().await?;
+        let client = self.client.get_client().await?;
+        let target_account = account_id.map(|s| s.to_string());
 
         info!(
             account_id = account_id.unwrap_or("all"),
             "Fetching positions"
         );
 
-        // TODO: Implement using ibapi v3's req_positions
-        // This returns a subscription of Position updates
+        let mut subscription = client
+            .positions()
+            .await
+            .map_err(|e| IbkrError::Unknown(format!("positions failed: {e}")))?;
 
-        Err(IbkrError::Unknown(
-            "Get positions not yet implemented".to_string(),
-        ))
+        let mut positions = Vec::new();
+        let collect_timeout = Duration::from_secs(5);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < collect_timeout {
+            match timeout(Duration::from_millis(500), subscription.next_data()).await {
+                Ok(Some(Ok(PositionUpdate::Position(pos)))) => {
+                    if target_account.is_none()
+                        || target_account.as_ref() == Some(&pos.account)
+                    {
+                        positions.push(Position {
+                            account_id: pos.account.clone(),
+                            symbol: pos.contract.symbol.to_string(),
+                            quantity: pos.position,
+                            average_cost: pos.average_cost,
+                            market_price: 0.0,
+                            market_value: 0.0,
+                            unrealized_pnl: 0.0,
+                            daily_pnl: 0.0,
+                        });
+                    }
+                }
+                Ok(Some(Ok(PositionUpdate::PositionEnd))) => break,
+                Ok(Some(Err(e))) => {
+                    return Err(IbkrError::Unknown(format!(
+                        "positions stream error: {e}"
+                    )));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if !positions.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(positions)
     }
+}
+
+fn parse_f64(s: &str) -> f64 {
+    s.parse().unwrap_or(0.0)
 }
