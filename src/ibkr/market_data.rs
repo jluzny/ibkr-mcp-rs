@@ -5,11 +5,20 @@ use tracing::{info, warn};
 
 use ibapi::prelude::*;
 use ibapi::market_data::realtime::TickType;
+use ibapi::market_data::MarketDataType;
 
 use crate::config::MarketDataConfig;
 use crate::ibkr::client::IbkrClient;
 use crate::ibkr::error::{IbkrError, is_entitlement_error};
 
+/// Try to extract an IB error code from an error string like "[10089] ..."
+fn extract_error_code(s: &str) -> Option<i32> {
+    s.strip_prefix('[')?
+        .split(']')
+        .next()?
+        .parse()
+        .ok()
+}
 /// A cached market data quote
 #[derive(Debug, Clone)]
 pub struct CachedQuote {
@@ -101,6 +110,13 @@ impl MarketDataManager {
 
         info!(symbol = %symbol, delayed = use_delayed, "Fetching market data snapshot");
 
+        // Switch to delayed market data type if requested
+        if use_delayed {
+            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
+                warn!(symbol = %symbol, error = %e, "Failed to switch to delayed market data type");
+            }
+        }
+
         // In ibapi v3, market data is always subscription-based.
         // Use `.snapshot()` for a one-time request that auto-cancels after first tick.
         let mut subscription = client
@@ -163,6 +179,40 @@ impl MarketDataManager {
                         _ => {}
                     }
                 }
+                Ok(SubscriptionItem::Data(TickTypes::PriceSize(ps))) => {
+                    match ps.price_tick_type {
+                        TickType::Bid | TickType::DelayedBid => {
+                            quote.bid = ps.price;
+                            got_data = true;
+                        }
+                        TickType::Ask | TickType::DelayedAsk => {
+                            quote.ask = ps.price;
+                            got_data = true;
+                        }
+                        TickType::Last | TickType::DelayedLast => {
+                            quote.last = ps.price;
+                            got_data = true;
+                        }
+                        TickType::High | TickType::DelayedHigh => {
+                            quote.high = ps.price;
+                        }
+                        TickType::Low | TickType::DelayedLow => {
+                            quote.low = ps.price;
+                        }
+                        TickType::Close | TickType::DelayedClose => {
+                            quote.close = ps.price;
+                        }
+                        _ => {}
+                    }
+                    match ps.size_tick_type {
+                        TickType::BidSize | TickType::AskSize | TickType::LastSize
+                        | TickType::DelayedBidSize | TickType::DelayedAskSize
+                        | TickType::DelayedLastSize => {
+                            quote.volume += ps.size as i64;
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(SubscriptionItem::Data(TickTypes::SnapshotEnd)) => {
                     info!(symbol = %symbol, "Snapshot complete");
                     break;
@@ -185,7 +235,17 @@ impl MarketDataManager {
                     warn!(code = notice.code, message = %notice.message, "Market data notice");
                 }
                 Err(e) => {
-                    return Err(IbkrError::MarketDataUnavailable(e.to_string()));
+                    let err_str = e.to_string();
+                    // Entitlement errors come as Err, not as Notice
+                    if let Some(code) = extract_error_code(&err_str) {
+                        if is_entitlement_error(code) {
+                            return Err(IbkrError::MarketDataSubscriptionRequired {
+                                code,
+                                message: err_str,
+                            });
+                        }
+                    }
+                    return Err(IbkrError::MarketDataUnavailable(err_str));
                 }
                 _ => {}
             }
@@ -193,6 +253,13 @@ impl MarketDataManager {
             if got_data {
                 // We got at least a price tick, can return early
                 // or wait for SnapshotEnd for completeness
+            }
+        }
+
+        // Switch back to real-time after delayed request
+        if use_delayed {
+            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Realtime).await {
+                warn!(symbol = %symbol, error = %e, "Failed to switch back to real-time market data type");
             }
         }
 
