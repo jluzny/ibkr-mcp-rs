@@ -5,16 +5,19 @@ use tokio_util::sync::CancellationToken;
 use ibkr_mcp_rs::config::Config;
 use ibkr_mcp_rs::ibkr::client::IbkrClient;
 use ibkr_mcp_rs::ibkr::market_data::MarketDataManager;
-use ibkr_mcp_rs::mcp::server::start_http_on;
+use ibkr_mcp_rs::mcp::server::start_http_on_with_config;
+use rmcp::transport::StreamableHttpServerConfig;
 
 /// Live E2E test against a running IB Gateway.
-/// Requires IB Gateway or TWS to be running on localhost:4002 (paper trading).
+/// Requires IB Gateway or TWS to be running on localhost:4003 (live trading).
 /// Run with: cargo test --test live_ibkr_test -- --ignored
 
 #[tokio::test]
-#[ignore = "Requires live IB Gateway on localhost:4002"]
+#[ignore = "Requires live IB Gateway on localhost:4003"]
 async fn test_live_market_data_quote() {
-    let config = Config::default();
+    let mut config = Config::default();
+    config.ibkr.port = 4003;
+    config.ibkr.paper_trading = false;
     let client = IbkrClient::new(config.ibkr.clone());
     client.clone().connect();
 
@@ -50,9 +53,11 @@ async fn test_live_market_data_quote() {
 }
 
 #[tokio::test]
-#[ignore = "Requires live IB Gateway on localhost:4002"]
+#[ignore = "Requires live IB Gateway on localhost:4003"]
 async fn test_live_mcp_server_with_ibkr() {
-    let config = Config::default();
+    let mut config = Config::default();
+    config.ibkr.port = 4003;
+    config.ibkr.paper_trading = false;
     let client = IbkrClient::new(config.ibkr.clone());
     client.clone().connect();
 
@@ -72,7 +77,11 @@ async fn test_live_mcp_server_with_ibkr() {
 
     let ct_clone = ct.clone();
     tokio::spawn(async move {
-        let _ = start_http_on(listener, client, ct_clone).await;
+        let http_config = StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+            .with_cancellation_token(ct_clone.child_token());
+        let _ = start_http_on_with_config(listener, client, http_config, ct_clone).await;
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -105,6 +114,7 @@ async fn test_live_mcp_server_with_ibkr() {
     let resp = http_client
         .post(format!("{}/mcp", url))
         .json(&init_request)
+        .header("Accept", "application/json, text/event-stream")
         .send()
         .await
         .unwrap();
