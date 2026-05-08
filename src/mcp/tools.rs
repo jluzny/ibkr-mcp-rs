@@ -5,7 +5,7 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{ServerCapabilities, ServerInfo},
-    tool, tool_router,
+    tool, tool_router, tool_handler,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -56,6 +56,7 @@ impl Default for IbkrMcpServer {
     }
 }
 
+#[tool_handler(router = Self::tool_router())]
 impl ServerHandler for IbkrMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -232,6 +233,10 @@ impl IbkrMcpServer {
     }
 }
 
+fn default_quote() -> String {
+    "quote".to_string()
+}
+
 // ============================================================================
 // Parameter types
 // ============================================================================
@@ -241,7 +246,8 @@ pub struct GetMarketDataParams {
     #[schemars(description = "Stock symbol, e.g. AAPL, AMD")]
     pub symbol: String,
 
-    #[schemars(description = "Type of data: 'quote', 'historical', or 'option_chain'")]
+    #[schemars(description = "Type of data: 'quote', 'historical', or 'option_chain'. Defaults to 'quote'.")]
+    #[serde(default = "default_quote")]
     pub data_type: String,
 
     #[schemars(description = "For historical data: time period like '1 D', '1 W'. Optional.")]
