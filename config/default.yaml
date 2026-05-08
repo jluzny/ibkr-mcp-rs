@@ -1,0 +1,29 @@
+# Default configuration for ibkr-mcp-rs
+
+# IBKR connection settings
+ibkr:
+  host: "127.0.0.1"
+  port: 4002        # Gateway paper trading; use 4001 for live
+  client_id: 100    # Unique client ID for this MCP server
+  paper_trading: true
+  read_only: true
+  connection_timeout_secs: 10
+  retry_attempts: 100
+  retry_delay_ms: 500
+
+# MCP server settings
+mcp:
+  host: "0.0.0.0"
+  port: 8881
+  session_timeout_secs: 0   # 0 = never auto-close
+
+# Market data caching
+market_data:
+  real_time_ttl_secs: 5
+  delayed_ttl_secs: 60
+  max_cache_entries: 1000
+
+# Logging
+logging:
+  level: "info"
+  format: "json"

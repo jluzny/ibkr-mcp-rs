@@ -1,0 +1,36 @@
+[package]
+name = "ibkr-mcp-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["jiri-options"]
+description = "Interactive Brokers MCP Server in Rust"
+license = "MIT"
+
+[dependencies]
+ibapi = { git = "https://github.com/wboayue/rust-ibapi", branch = "main" }
+rmcp = { version = "1.6", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "schemars",
+    "transport-io",
+] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+figment = { version = "0.10", features = ["yaml", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+axum = { version = "0.8", features = ["http1", "tokio"] }
+tower = "0.5"
+dashmap = "6.1"
+thiserror = "2"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+schemars = { version = "1.0", features = ["chrono04"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
