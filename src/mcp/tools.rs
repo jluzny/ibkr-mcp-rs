@@ -1,3 +1,17 @@
+//! MCP tool definitions for the IBKR MCP server.
+//!
+//! Implements four MCP tools via the `rmcp` macro-driven router:
+//!
+//! | Tool | Handler | Description |
+//! |------|---------|-------------|
+//! | `get_market_data` | `IbkrMcpServer::get_market_data` | Stock quotes with delayed-data fallback |
+//! | `get_account_info` | `IbkrMcpServer::get_account_info` | Account summary (net liquidation, funds, PnL) |
+//! | `get_positions` | `IbkrMcpServer::get_positions` | Current holdings per account |
+//! | `get_connection_status` | `IbkrMcpServer::get_connection_status` | IBKR gateway connectivity |
+//!
+//! All tools return JSON strings that the MCP client receives as text content.
+//! Error responses include `"success": false` and an `"error"` field.
+
 use rmcp::{
     ServerHandler,
     handler::server::{
@@ -17,7 +31,11 @@ use crate::ibkr::market_data::{MarketDataManager, QuoteSource};
 use crate::ibkr::account::AccountManager;
 use crate::ibkr::orders::OrderManager;
 
-/// MCP server state — holds all IBKR managers
+/// MCP server state — holds all IBKR managers and routes tool calls.
+///
+/// Built via [`IbkrMcpServer::new`] with a shared [`IbkrClient`].
+/// The [`Default`] implementation wires up a client from default config
+/// and is mainly useful for testing.
 #[derive(Debug, Clone)]
 pub struct IbkrMcpServer {
     #[allow(dead_code)]

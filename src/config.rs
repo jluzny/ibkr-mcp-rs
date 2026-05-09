@@ -1,5 +1,19 @@
+//! Configuration management for ibkr-mcp-rs.
+//!
+//! Uses [`figment`](https://docs.rs/figment) to layer configuration sources:
+//!
+//! 1. Environment variables prefixed with `IBKR_MCP__`
+//! 2. `config/{env}.yaml` (where `env` defaults to `development`)
+//! 3. `config/default.yaml`
+//! 4. Built-in defaults
+//!
+//! Example environment overrides:
+//! ```bash
+//! IBKR_MCP__IBKR__HOST=192.168.1.10 IBKR_MCP__MCP__PORT=9000 ./ibkr-mcp-rs
+//! ```
+
 use figment::{
-    providers::{Env, Format, Yaml},
+    providers::{Env, Format, Serialized, Yaml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
@@ -83,7 +97,9 @@ impl Config {
         let env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
         let env_file = format!("config/{}.yaml", env);
 
+        // Start with default values so the binary works without any config files
         let mut figment = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
             .merge(Yaml::file("config/default.yaml"));
 
         if std::path::Path::new(&env_file).exists() {

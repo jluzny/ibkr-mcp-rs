@@ -1,3 +1,17 @@
+//! IBKR connection manager with automatic reconnection.
+//!
+//! [`IbkrClient`] wraps the `ibapi::Client` in an `Arc<RwLock<Option<...>>>`
+//! so it can be shared across async tasks and safely replaced on reconnect.
+//!
+//! ## Connection Lifecycle
+//!
+//! 1. Create with [`IbkrClient::new`]
+//! 2. Call [`connect`](IbkrClient::connect) to start a background reconnection loop
+//! 3. Use [`get_client`](IbkrClient::get_client) to borrow the inner `ibapi::Client`
+//! 4. Call [`disconnect`](IbkrClient::disconnect) on shutdown
+//!
+//! The loop uses exponential backoff capped at 15 s and retries indefinitely.
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -9,8 +23,8 @@ use ibapi::prelude::*;
 use crate::config::IbkrConfig;
 use crate::ibkr::error::IbkrError;
 
-/// Shared IBKR client state
-/// Stores Arc<Client> in RwLock for safe concurrent access and reconnection.
+/// Shared IBKR client state.
+/// Stores `Arc<Client>` in `RwLock` for safe concurrent access and reconnection.
 pub struct IbkrClient {
     pub config: IbkrConfig,
     inner: Arc<RwLock<Option<Arc<Client>>>>,
@@ -104,7 +118,7 @@ impl IbkrClient {
         guard.as_ref().map(|c| c.is_connected()).unwrap_or(false)
     }
 
-    /// Get a clone of the Arc<Client> for use in async operations.
+    /// Get a clone of the `Arc<Client>` for use in async operations.
     /// Returns error if not connected.
     pub async fn get_client(&self) -> Result<Arc<Client>, IbkrError> {
         let guard = self.inner.read().await;
