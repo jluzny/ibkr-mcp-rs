@@ -15,6 +15,19 @@ use rmcp::{
 use crate::config::McpConfig;
 use crate::mcp::tools::IbkrMcpServer;
 
+use rmcp::ServiceExt;
+
+/// Start the MCP stdio server
+pub async fn start_stdio(
+    client: Arc<crate::ibkr::client::IbkrClient>,
+) -> anyhow::Result<()> {
+    info!("Starting MCP stdio server");
+    let server = IbkrMcpServer::new(client);
+    let running = server.serve(rmcp::transport::stdio()).await?;
+    running.waiting().await?;
+    Ok(())
+}
+
 /// Start the MCP HTTP server on the configured address
 pub async fn start_http(
     client: Arc<crate::ibkr::client::IbkrClient>,
