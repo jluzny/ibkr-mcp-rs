@@ -6,6 +6,8 @@ use tracing::{info, warn};
 use ibapi::prelude::*;
 use ibapi::market_data::realtime::TickType;
 use ibapi::market_data::MarketDataType;
+use ibapi::subscriptions::SubscriptionItemStreamExt;
+use futures::StreamExt;
 
 use crate::config::MarketDataConfig;
 use crate::ibkr::client::IbkrClient;
@@ -290,19 +292,239 @@ impl MarketDataManager {
         ))
     }
 
+    /// Get quotes for multiple symbols concurrently.
+    /// Uses tokio::spawn per symbol — 12 symbols should return in ~15s instead of 12×15s.
+    pub async fn get_bulk_quotes(
+        market_data: Arc<MarketDataManager>,
+        symbols: &[String],
+    ) -> Vec<(String, Result<CachedQuote, IbkrError>)> {
+        let tasks: Vec<_> = symbols
+            .iter()
+            .map(|symbol| {
+                let md = Arc::clone(&market_data);
+                let sym = symbol.clone();
+                tokio::spawn(async move {
+                    let result = md.get_quote(&sym).await;
+                    (sym, result)
+                })
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(pair) => results.push(pair),
+                Err(e) => results.push((
+                    String::new(),
+                    Err(IbkrError::Unknown(format!("Task join error: {}", e))),
+                )),
+            }
+        }
+        results
+    }
+
     /// Get option chain for a symbol
     pub async fn get_option_chain(
         &self,
         symbol: &str,
-    ) -> Result<OptionChain, IbkrError> {
-        let _client = self.client.get_client().await?;
+    ) -> Result<ibapi::contracts::OptionChain, IbkrError> {
+        let client = self.client.get_client().await?;
 
-        info!(symbol = %symbol, "Fetching option chain");
+        info!(symbol = %symbol, "Fetching option chain via sec_def_opt_params");
 
-        // TODO: Implement using ibapi v3's sec_def_opt_params
-        Err(IbkrError::Unknown(
-            "Option chain not yet implemented".to_string(),
-        ))
+        // Use ibapi v3's option_chain() which sends reqSecDefOptParams
+        let mut subscription = client
+            .option_chain(symbol, "SMART", SecurityType::Stock, 0)
+            .await
+            .map_err(|e| IbkrError::Unknown(format!("option_chain request failed: {e}")))?;
+
+        let mut result: Option<ibapi::contracts::OptionChain> = None;
+
+        let mut data_stream = subscription.filter_data();
+
+        while let Some(chain_result) = data_stream.next().await {
+            match chain_result {
+                Ok(chain) => {
+                    result = Some(chain);
+                }
+                Err(e) => {
+                    return Err(IbkrError::Unknown(format!(
+                        "option_chain stream error: {e:?}"
+                    )));
+                }
+            }
+        }
+
+        match result {
+            Some(chain) => {
+                info!(
+                    symbol = %symbol,
+                    expirations = chain.expirations.len(),
+                    strikes = chain.strikes.len(),
+                    "Option chain received"
+                );
+                Ok(chain)
+            }
+            None => Err(IbkrError::Unknown(format!(
+                "No option chain data received for {symbol}"
+            ))),
+        }
+    }
+
+    /// Fetch a market data snapshot for an option contract.
+    /// Shares the same caching/delayed-fallback logic as get_quote.
+    pub async fn get_option_quote(
+        &self,
+        contract: &ibapi::contracts::Contract,
+        label: &str,
+    ) -> Result<CachedQuote, IbkrError> {
+        let cache_key = label.to_uppercase();
+
+        // Check cache
+        if let Some(entry) = self.cache.get(&cache_key) {
+            let ttl = Duration::from_secs(self.config.real_time_ttl_secs);
+            if entry.timestamp.elapsed() < ttl {
+                info!(cache_key = %cache_key, source = ?entry.source, "Cache hit");
+                return Ok(entry.clone());
+            }
+        }
+
+        let use_delayed = self.delayed_symbols.contains_key(&cache_key);
+
+        // Use the internal fetch method but with a custom contract
+        // We need a variant that accepts an arbitrary Contract. Since fetch_quote
+        // builds Contract::stock() internally, we add a parallel path here.
+        let quote = self.fetch_option_quote(contract, &cache_key, use_delayed).await?;
+        self.cache.insert(cache_key.clone(), quote.clone());
+        Ok(quote)
+    }
+
+    /// Internal: snapshot market data for an arbitrary contract (options, etc.)
+    async fn fetch_option_quote(
+        &self,
+        contract: &ibapi::contracts::Contract,
+        label: &str,
+        use_delayed: bool,
+    ) -> Result<CachedQuote, IbkrError> {
+        let client = self.client.get_client().await?;
+
+        info!(label = %label, delayed = use_delayed, "Fetching option market data snapshot");
+
+        if use_delayed {
+            if let Err(e) = client.switch_market_data_type(MarketDataType::Delayed).await {
+                warn!(label = %label, error = %e, "Failed to switch to delayed market data type");
+            }
+        }
+
+        let mut subscription = client
+            .market_data(contract)
+            .snapshot()
+            .subscribe()
+            .await
+            .map_err(|e| IbkrError::MarketDataUnavailable(e.to_string()))?;
+
+        let mut quote = CachedQuote {
+            symbol: label.to_string(),
+            bid: 0.0,
+            ask: 0.0,
+            last: 0.0,
+            volume: 0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            timestamp: Instant::now(),
+            source: if use_delayed { QuoteSource::Delayed } else { QuoteSource::RealTime },
+        };
+
+        let mut got_data = false;
+
+        while let Some(result) = subscription.next().await {
+            match result {
+                Ok(SubscriptionItem::Data(TickTypes::Price(p))) => {
+                    match p.tick_type {
+                        TickType::Bid | TickType::DelayedBid => { quote.bid = p.price; got_data = true; }
+                        TickType::Ask | TickType::DelayedAsk => { quote.ask = p.price; got_data = true; }
+                        TickType::Last | TickType::DelayedLast => { quote.last = p.price; got_data = true; }
+                        TickType::High | TickType::DelayedHigh => { quote.high = p.price; }
+                        TickType::Low | TickType::DelayedLow => { quote.low = p.price; }
+                        TickType::Close | TickType::DelayedClose => { quote.close = p.price; }
+                        _ => {}
+                    }
+                }
+                Ok(SubscriptionItem::Data(TickTypes::Size(s))) => {
+                    match s.tick_type {
+                        TickType::BidSize | TickType::AskSize | TickType::LastSize
+                        | TickType::DelayedBidSize | TickType::DelayedAskSize
+                        | TickType::DelayedLastSize => { quote.volume += s.size as i64; }
+                        _ => {}
+                    }
+                }
+                Ok(SubscriptionItem::Data(TickTypes::PriceSize(ps))) => {
+                    match ps.price_tick_type {
+                        TickType::Bid | TickType::DelayedBid => { quote.bid = ps.price; got_data = true; }
+                        TickType::Ask | TickType::DelayedAsk => { quote.ask = ps.price; got_data = true; }
+                        TickType::Last | TickType::DelayedLast => { quote.last = ps.price; got_data = true; }
+                        TickType::High | TickType::DelayedHigh => { quote.high = ps.price; }
+                        TickType::Low | TickType::DelayedLow => { quote.low = ps.price; }
+                        TickType::Close | TickType::DelayedClose => { quote.close = ps.price; }
+                        _ => {}
+                    }
+                    match ps.size_tick_type {
+                        TickType::BidSize | TickType::AskSize | TickType::LastSize
+                        | TickType::DelayedBidSize | TickType::DelayedAskSize
+                        | TickType::DelayedLastSize => { quote.volume += ps.size as i64; }
+                        _ => {}
+                    }
+                }
+                Ok(SubscriptionItem::Data(TickTypes::SnapshotEnd)) => {
+                    info!(label = %label, "Snapshot complete");
+                    break;
+                }
+                Ok(SubscriptionItem::Data(TickTypes::MarketDataType(dt))) => {
+                    quote.source = match dt {
+                        MarketDataType::Delayed | MarketDataType::DelayedFrozen => QuoteSource::Delayed,
+                        _ => quote.source,
+                    };
+                }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    if is_entitlement_error(notice.code) {
+                        return Err(IbkrError::MarketDataSubscriptionRequired {
+                            code: notice.code,
+                            message: notice.message.clone(),
+                        });
+                    }
+                    warn!(code = notice.code, message = %notice.message, "Market data notice");
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if let Some(code) = extract_error_code(&err_str) {
+                        if is_entitlement_error(code) {
+                            return Err(IbkrError::MarketDataSubscriptionRequired {
+                                code,
+                                message: err_str,
+                            });
+                        }
+                    }
+                    return Err(IbkrError::MarketDataUnavailable(err_str));
+                }
+                _ => {}
+            }
+        }
+
+        if use_delayed {
+            if let Err(e) = client.switch_market_data_type(MarketDataType::Realtime).await {
+                warn!(label = %label, error = %e, "Failed to switch back to real-time");
+            }
+        }
+
+        if !got_data {
+            return Err(IbkrError::MarketDataUnavailable(
+                "No market data received".to_string(),
+            ));
+        }
+
+        quote.timestamp = Instant::now();
+        Ok(quote)
     }
 }
 

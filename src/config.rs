@@ -64,7 +64,7 @@ impl Default for Config {
         Config {
             ibkr: IbkrConfig {
                 host: "127.0.0.1".to_string(),
-                port: 4002,
+                port: 4003,
                 client_id: 100,
                 paper_trading: true,
                 read_only: true,
@@ -120,14 +120,14 @@ mod tests {
     #[test]
     fn test_config_load_default() {
         let config = Config::load().expect("should load default config");
-        assert_eq!(config.ibkr.port, 4002);
+        assert_eq!(config.ibkr.port, 4003);
         assert_eq!(config.mcp.port, 8881);
     }
 
     #[test]
     fn test_config_default_values() {
         let config = Config::default();
-        assert_eq!(config.ibkr.port, 4002);
+        assert_eq!(config.ibkr.port, 4003);
         assert_eq!(config.mcp.port, 8881);
         assert_eq!(config.ibkr.host, "127.0.0.1");
         assert_eq!(config.mcp.host, "0.0.0.0");

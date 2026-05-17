@@ -1,10 +1,11 @@
 //! MCP tool definitions for the IBKR MCP server.
 //!
-//! Implements four MCP tools via the `rmcp` macro-driven router:
+//! Implements five MCP tools via the `rmcp` macro-driven router:
 //!
 //! | Tool | Handler | Description |
 //! |------|---------|-------------|
 //! | `get_market_data` | `IbkrMcpServer::get_market_data` | Stock quotes with delayed-data fallback |
+//! | `get_bulk_quotes` | `IbkrMcpServer::get_bulk_quotes` | Concurrent quotes for multiple symbols |
 //! | `get_account_info` | `IbkrMcpServer::get_account_info` | Account summary (net liquidation, funds, PnL) |
 //! | `get_positions` | `IbkrMcpServer::get_positions` | Current holdings per account |
 //! | `get_connection_status` | `IbkrMcpServer::get_connection_status` | IBKR gateway connectivity |
@@ -163,6 +164,58 @@ impl IbkrMcpServer {
         }
     }
 
+    /// Get quotes for multiple symbols concurrently
+    #[tool(description = "Get market quotes for multiple symbols concurrently. Much faster than individual calls.")]
+    async fn get_bulk_quotes(
+        &self,
+        Parameters(params): Parameters<GetBulkQuotesParams>,
+    ) -> String {
+        use crate::ibkr::market_data::MarketDataManager;
+
+        let symbols: Vec<String> = params
+            .symbols
+            .iter()
+            .map(|s| s.to_uppercase())
+            .collect();
+
+        let results = MarketDataManager::get_bulk_quotes(
+            Arc::clone(&self.market_data),
+            &symbols,
+        )
+        .await;
+
+        let quotes: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|(sym, result)| match result {
+                Ok(quote) => serde_json::json!({
+                    "success": true,
+                    "symbol": sym,
+                    "data_type": "quote",
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "last": quote.last,
+                    "volume": quote.volume,
+                    "high": quote.high,
+                    "low": quote.low,
+                    "close": quote.close,
+                    "source": match quote.source {
+                        QuoteSource::RealTime => "realtime",
+                        QuoteSource::Delayed => "delayed",
+                        QuoteSource::Cache => "cache",
+                    },
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }),
+                Err(e) => serde_json::json!({
+                    "success": false,
+                    "symbol": sym,
+                    "error": e.to_string(),
+                }),
+            })
+            .collect();
+
+        serde_json::to_string_pretty(&quotes).unwrap_or_default()
+    }
+
     /// Get account information
     #[tool(description = "Get account information including net liquidation, available funds, buying power, and daily PnL.")]
     async fn get_account_info(
@@ -219,6 +272,11 @@ impl IbkrMcpServer {
                             "marketValue": p.market_value,
                             "unrealizedPnL": p.unrealized_pnl,
                             "dailyPnL": p.daily_pnl,
+                            "securityType": p.security_type,
+                            "strike": p.strike,
+                            "right": p.right,
+                            "expiration": p.expiration,
+                            "multiplier": p.multiplier,
                         })).collect::<Vec<_>>(),
                     })
                 )
@@ -248,6 +306,123 @@ impl IbkrMcpServer {
             })
         )
         .unwrap_or_default()
+    }
+
+    /// Get option chain for a symbol
+    #[tool(description = "Get the option chain for a stock symbol — returns all available expirations and strikes via IBKR's sec_def_opt_params.")]
+    async fn get_option_chain(
+        &self,
+        Parameters(params): Parameters<GetOptionChainParams>,
+    ) -> String {
+        match self.market_data.get_option_chain(&params.symbol).await {
+            Ok(chain) => {
+                let result = serde_json::json!({
+                    "success": true,
+                    "symbol": params.symbol,
+                    "exchange": chain.exchange,
+                    "underlying_contract_id": chain.underlying_contract_id,
+                    "trading_class": chain.trading_class,
+                    "multiplier": chain.multiplier,
+                    "expirations": chain.expirations,
+                    "strikes": chain.strikes,
+                });
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            }
+            Err(e) => {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": false,
+                        "symbol": params.symbol,
+                        "error": e.to_string(),
+                    })
+                )
+                .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Get quote for an option contract
+    #[tool(description = "Get a market data quote for a specific option contract. Specify underlying symbol, strike, expiration (YYYYMMDD), and right (C or P).")]
+    async fn get_option_quote(
+        &self,
+        Parameters(params): Parameters<GetOptionQuoteParams>,
+    ) -> String {
+        let symbol = params.symbol.to_uppercase();
+        let right = params.right.to_uppercase();
+
+        // Parse expiration date YYYYMMDD
+        let (year, month, day) = match params.expiration.len() {
+            8 => {
+                let y: i32 = params.expiration[0..4].parse().unwrap_or(0);
+                let m: u32 = params.expiration[4..6].parse().unwrap_or(0);
+                let d: u32 = params.expiration[6..8].parse().unwrap_or(0);
+                (y, m, d)
+            }
+            _ => {
+                return serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid expiration format '{}'. Use YYYYMMDD.", params.expiration),
+                    })
+                )
+                .unwrap_or_default();
+            }
+        };
+
+        let contract = match right.as_str() {
+            "C" => crate::ibkr::contract::option_call(&symbol, params.strike, year, month, day),
+            "P" => crate::ibkr::contract::option_put(&symbol, params.strike, year, month, day),
+            _ => {
+                return serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": false,
+                        "error": format!("Invalid right '{}'. Use 'C' for Call or 'P' for Put.", params.right),
+                    })
+                )
+                .unwrap_or_default();
+            }
+        };
+
+        let label = format!("{} {} {}{}", symbol, params.expiration, right, params.strike);
+
+        match self.market_data.get_option_quote(&contract, &label).await {
+            Ok(quote) => {
+                let result = serde_json::json!({
+                    "success": true,
+                    "symbol": symbol,
+                    "expiration": params.expiration,
+                    "right": right,
+                    "strike": params.strike,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "last": quote.last,
+                    "volume": quote.volume,
+                    "high": quote.high,
+                    "low": quote.low,
+                    "close": quote.close,
+                    "source": match quote.source {
+                        QuoteSource::RealTime => "realtime",
+                        QuoteSource::Delayed => "delayed",
+                        QuoteSource::Cache => "cache",
+                    },
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            }
+            Err(e) => {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": false,
+                        "symbol": symbol,
+                        "expiration": params.expiration,
+                        "right": right,
+                        "strike": params.strike,
+                        "error": e.to_string(),
+                    })
+                )
+                .unwrap_or_default()
+            }
+        }
     }
 }
 
@@ -293,6 +468,33 @@ pub struct GetPositionsParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GetConnectionStatusParams {}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetBulkQuotesParams {
+    #[schemars(description = "List of stock symbols, e.g. ['AAPL', 'AMD', 'TSLA']")]
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetOptionChainParams {
+    #[schemars(description = "Stock symbol, e.g. SPY, AAPL, AMD")]
+    pub symbol: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetOptionQuoteParams {
+    #[schemars(description = "Underlying stock symbol, e.g. SPY, AAPL")]
+    pub symbol: String,
+
+    #[schemars(description = "Expiration date in YYYYMMDD format, e.g. '20250618'")]
+    pub expiration: String,
+
+    #[schemars(description = "Strike price, e.g. 200.0")]
+    pub strike: f64,
+
+    #[schemars(description = "Option right: 'C' for Call or 'P' for Put")]
+    pub right: String,
+}
 
 // ============================================================================
 // Result types

@@ -16,7 +16,6 @@
 //! ## Quick Example — HTTP Server
 //!
 //! ```no_run
-//! use std::sync::Arc;
 //! use ibkr_mcp_rs::config::Config;
 //! use ibkr_mcp_rs::ibkr::client::IbkrClient;
 //! use ibkr_mcp_rs::mcp::server::start_http;
@@ -27,7 +26,7 @@
 //! let client = IbkrClient::new(config.ibkr.clone());
 //! client.clone().connect();
 //! let ct = CancellationToken::new();
-//! start_http(Arc::new(client), config.mcp, ct).await?;
+//! start_http(client, config.mcp, ct).await?;
 //! # Ok(()) }
 //! ```
 

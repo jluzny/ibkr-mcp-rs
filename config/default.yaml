@@ -3,9 +3,9 @@
 # IBKR connection settings
 ibkr:
   host: "127.0.0.1"
-  port: 4002        # Gateway paper trading; use 4001 for live
+  port: 4003        # Gateway live trading
   client_id: 100    # Unique client ID for this MCP server
-  paper_trading: true
+  paper_trading: false
   read_only: true
   connection_timeout_secs: 10
   retry_attempts: 100
@@ -19,8 +19,8 @@ mcp:
 
 # Market data caching
 market_data:
-  real_time_ttl_secs: 5
-  delayed_ttl_secs: 60
+  real_time_ttl_secs: 15       # 15s during market hours (was 5s)
+  delayed_ttl_secs: 3600       # 1h for closed-market / delayed data (was 60s)
   max_cache_entries: 1000
 
 # Logging

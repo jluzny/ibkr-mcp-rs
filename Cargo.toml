@@ -19,6 +19,7 @@ rmcp = { version = "1.6", features = [
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+futures = "0.3"
 figment = { version = "0.10", features = ["yaml", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

@@ -1,5 +1,8 @@
 use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
 use ibapi::accounts::types::AccountGroup;
+use ibapi::contracts::SecurityType;
+use ibapi::subscriptions::SubscriptionItemStreamExt;
+use futures::StreamExt;
 use tokio::time::{timeout, Duration};
 use std::sync::Arc;
 use tracing::info;
@@ -31,6 +34,11 @@ pub struct Position {
     pub market_value: f64,
     pub unrealized_pnl: f64,
     pub daily_pnl: f64,
+    pub security_type: String,
+    pub strike: Option<f64>,
+    pub right: Option<String>,
+    pub expiration: Option<String>,
+    pub multiplier: Option<String>,
 }
 
 /// Account manager
@@ -86,11 +94,12 @@ impl AccountManager {
         let mut values: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
 
+        let mut data_stream = subscription.filter_data();
         let collect_timeout = Duration::from_secs(5);
         let start = std::time::Instant::now();
 
         while start.elapsed() < collect_timeout {
-            match timeout(Duration::from_millis(500), subscription.next_data()).await {
+            match timeout(Duration::from_millis(500), data_stream.next()).await {
                 Ok(Some(Ok(AccountSummaryResult::Summary(summary)))) => {
                     if target_account.is_none()
                         || target_account.as_ref() == Some(&summary.account)
@@ -157,16 +166,18 @@ impl AccountManager {
             .await
             .map_err(|e| IbkrError::Unknown(format!("positions failed: {e}")))?;
 
+        let mut data_stream = subscription.filter_data();
         let mut positions = Vec::new();
         let collect_timeout = Duration::from_secs(5);
         let start = std::time::Instant::now();
 
         while start.elapsed() < collect_timeout {
-            match timeout(Duration::from_millis(500), subscription.next_data()).await {
+            match timeout(Duration::from_millis(500), data_stream.next()).await {
                 Ok(Some(Ok(PositionUpdate::Position(pos)))) => {
                     if target_account.is_none()
                         || target_account.as_ref() == Some(&pos.account)
                     {
+                        let is_option = pos.contract.security_type == SecurityType::Option;
                         positions.push(Position {
                             account_id: pos.account.clone(),
                             symbol: pos.contract.symbol.to_string(),
@@ -176,6 +187,19 @@ impl AccountManager {
                             market_value: 0.0,
                             unrealized_pnl: 0.0,
                             daily_pnl: 0.0,
+                            security_type: pos.contract.security_type.to_string(),
+                            strike: if is_option && pos.contract.strike > 0.0 { Some(pos.contract.strike) } else { None },
+                            right: pos.contract.right.as_ref().map(|r| r.as_str().to_string()),
+                            expiration: if is_option && !pos.contract.last_trade_date_or_contract_month.is_empty() {
+                                Some(pos.contract.last_trade_date_or_contract_month.clone())
+                            } else {
+                                None
+                            },
+                            multiplier: if is_option && !pos.contract.multiplier.is_empty() {
+                                Some(pos.contract.multiplier.clone())
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
@@ -201,3 +225,7 @@ impl AccountManager {
 fn parse_f64(s: &str) -> f64 {
     s.parse().unwrap_or(0.0)
 }
+
+#[cfg(test)]
+#[path = "account_tests.rs"]
+mod tests;
