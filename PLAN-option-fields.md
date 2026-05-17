@@ -90,47 +90,50 @@ For stock positions, option fields are `null`:
 
 ---
 
-## Phase 1 — Verify ibapi Field Names (BLOCKER)
+## Phase 1 — Verify ibapi Field Names ✅ COMPLETE
 
-We do not have access to the ibapi source inside the container (cargo git checkouts are empty/expired). Before writing any code, we must confirm the actual field names and types on `pos.contract`.
+Cloned `rust-ibapi` from `https://github.com/wboayue/rust-ibapi` (branch `main`).
 
-### Step 1.1: Get ibapi source
+### Confirmed ibapi types and field names
 
-```bash
-# Option A: Clone on host
-git clone -b main https://github.com/wboayue/rust-ibapi /tmp/rust-ibapi
-grep -rn "pub struct Contract" /tmp/rust-ibapi/src/
+**`Contract` struct** (`src/contracts/mod.rs:177`):
 
-# Option B: Force cargo to re-fetch inside container
-docker exec hermes-agent sh -c 'cd /data/dev/trading/ibkr-mcp-rs && cargo fetch 2>&1'
-find /usr/local/cargo/git -name "contract*" -name "*.rs"
-```
+| Field | Type | Notes |
+|-------|------|-------|
+| `security_type` | `SecurityType` (enum) | Has `Display` impl → `"STK"`, `"OPT"`, etc. |
+| `strike` | `f64` | Always present, `0.0` for non-options |
+| `right` | `Option<OptionRight>` | `None` for stocks, `Some(Call)` or `Some(Put)` for options |
+| `last_trade_date_or_contract_month` | `String` | `"YYYYMMDD"` or `"YYYYMM"` format |
+| `multiplier` | `String` | `"100"` for equity options, `""` for stocks |
 
-### Step 1.2: Identify Contract struct fields
+**`SecurityType` enum** (`src/contracts/mod.rs:47`):
+- `SecurityType::Stock` → Display = `"STK"`
+- `SecurityType::Option` → Display = `"OPT"`
+- Implements `Display` via `to_string()` ✅
+- Supports `PartialEq` for comparison ✅
 
-Look for these specifically:
+**`OptionRight` enum** (`src/contracts/types.rs:188`):
+- `OptionRight::Call` → `as_str()` = `"C"`
+- `OptionRight::Put` → `as_str()` = `"P"`
+- No `Default` — carried as `Option<OptionRight>` on Contract
 
-| Field we need | Possible ibapi names | Type guess |
-|---------------|----------------------|------------|
-| Strike | `strike` | `f64` or `Decimal` |
-| Right (P/C) | `right` | `String` |
-| Expiration | `last_trade_date_or_contract_month`, `expiry`, `expiration` | `String` (YYYYMMDD) |
-| Multiplier | `multiplier` | `String` ("100") |
-| Security type | `security_type`, `sec_type` | enum or `String` |
-
-### Step 1.3: Identify PositionUpdate struct
-
-Find what fields `pos.contract` has when streaming positions for an option. Specifically: does the positions stream even return contract details, or just symbol + account?
-
-### Step 1.4: Live smoke test
-
-Add a temporary debug print in `get_positions()`:
-
+**`Position` struct from ibapi** (`src/accounts/mod.rs:187`):
 ```rust
-tracing::info!("Position contract: {:?}", pos.contract);
+pub struct Position {
+    pub account: String,
+    pub contract: Contract,   // ← FULL contract with all fields above
+    pub position: f64,
+    pub average_cost: f64,
+}
 ```
 
-Run against live TWS and check logs for an option position. This confirms TWS actually sends strike/expiry in the positions stream (it should — the TWS API spec says it does).
+**Key finding:** `pos.contract` in the positions stream contains the **full** `Contract` struct — strike, right, expiry, multiplier, security_type are all available. The current `ibkr-mcp-rs` code just extracts `pos.contract.symbol` and discards everything else.
+
+**Bonus finding:** `AccountPortfolioValue` (`src/accounts/mod.rs`) has `market_price`, `market_value`, `unrealized_pnl`, `realized_pnl` — but this is a different stream (`account_updates`), not `positions()`. The positions stream only returns `account`, `contract`, `position`, `average_cost`.
+
+### Remaining unknown: does TWS populate strike/expiry in positions stream?
+
+The ibapi `Position` struct embeds a full `Contract`, so the data path exists. TWS historically populates contract details in position messages (verified by IBKR API docs). **Step 1.4 (live smoke test) recommended before Phase 2.**
 
 ---
 
@@ -190,9 +193,11 @@ positions.push(Position {
 });
 ```
 
-New (field names TBD from Phase 1):
+New (exact field names from Phase 1):
 
 ```rust
+let is_option = pos.contract.security_type == SecurityType::Option;
+
 positions.push(Position {
     account_id: pos.account.clone(),
     symbol: pos.contract.symbol.to_string(),
@@ -203,22 +208,14 @@ positions.push(Position {
     unrealized_pnl: 0.0,
     daily_pnl: 0.0,
     security_type: pos.contract.security_type.to_string(),
-    strike: if pos.contract.security_type == SecurityType::Option {
-        Some(pos.contract.strike)
+    strike: if is_option { Some(pos.contract.strike) } else { None },
+    right: pos.contract.right.as_ref().map(|r| r.as_str().to_string()),
+    expiration: if is_option && !pos.contract.last_trade_date_or_contract_month.is_empty() {
+        Some(pos.contract.last_trade_date_or_contract_month.clone())
     } else {
         None
     },
-    right: if pos.contract.security_type == SecurityType::Option {
-        Some(pos.contract.right.clone())
-    } else {
-        None
-    },
-    expiration: if pos.contract.security_type == SecurityType::Option {
-        Some(pos.contract.EXPIRY_FIELD_NAME.clone())  // TBD in Phase 1
-    } else {
-        None
-    },
-    multiplier: if pos.contract.security_type == SecurityType::Option {
+    multiplier: if is_option && !pos.contract.multiplier.is_empty() {
         Some(pos.contract.multiplier.clone())
     } else {
         None
@@ -226,7 +223,13 @@ positions.push(Position {
 });
 ```
 
-**Note:** The `SecurityType::Option` comparison syntax depends on how ibapi defines the enum. Could be string match (`"OPT"`) or enum variant. Phase 1 determines this.
+**Notes:**
+- `security_type.to_string()` works because `SecurityType` implements `Display` → `"STK"`, `"OPT"`, etc.
+- `strike` is `f64` on Contract, always populated (0.0 for stocks). We gate on `is_option` to return `None` for stocks.
+- `right` is `Option<OptionRight>` — `None` for stocks, `Some(Call)` or `Some(Put)` for options. We convert via `.as_ref().map(|r| r.as_str().to_string())` → `None`, `Some("C")`, or `Some("P")`.
+- `last_trade_date_or_contract_month` is `String` — can be empty. We check `is_empty()` as well.
+- `multiplier` is `String` — empty for stocks, `"100"` for equity options. We check `is_empty()`.
+- Requires `use ibapi::prelude::*;` already in scope (confirmed in contract.rs).
 
 ### Step 2.3: Edit `src/mcp/tools.rs` — JSON serialization
 
@@ -487,8 +490,19 @@ OPTION: XXI P17.5 exp=20260717 x100
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| ibapi Contract doesn't expose strike/expiry in positions stream | Low (TWS API spec says it does) | High — entire plan fails | Phase 1 step 4 (live smoke test) catches this early |
-| Field names differ from assumptions | Medium | Low — just rename in code | Phase 1 resolves |
-| `SecurityType` enum doesn't implement `Display` | Medium | Low — match on string literal instead | Check in Phase 1 |
-| Cargo build fails in container (no Rust toolchain) | Medium | Medium — need to build on host | Copy binary approach |
-| Change breaks existing MCP consumers | Low | High — additive only, no fields removed or renamed | Additive change is safe |
+| TWS doesn't populate strike/expiry in positions stream | Low (ibapi struct has full Contract, API spec confirms) | High — entire plan fails | Live smoke test before Phase 2 (add `tracing::info!("{:?}", pos.contract)` temporarily) |
+| `strike` is 0.0 for stocks instead of unset | Confirmed | None — we gate on `is_option` | Already handled: `if is_option { Some(strike) } else { None }` |
+| `right` is `None` for stocks (not `Some("?")`) | Confirmed | None | Already handled: `.as_ref().map()` |
+| `multiplier` is empty string for stocks | Confirmed | None | Already handled: `!is_empty()` check |
+| `last_trade_date_or_contract_month` empty for some options | Possible | Low | Handled: `!is_empty()` check returns `None` |
+| Cargo build fails in container (no Rust toolchain) | Medium | Medium | Build on host, copy binary |
+| Change breaks existing MCP consumers | Low | High | Additive only — no fields removed or renamed |
+
+## Appendix: ibapi Source Verification
+
+Cloned `rust-ibapi` from `https://github.com/wboayue/rust-ibapi` branch `main` to `/tmp/rust-ibapi/`.
+
+Key files inspected:
+- `src/contracts/mod.rs` — Contract struct (line 177), SecurityType enum (line 47), Display impl (line 94)
+- `src/contracts/types.rs` — OptionRight enum (line 188)
+- `src/accounts/mod.rs` — Position struct (line 187), AccountPortfolioValue (line 244 — has market_price etc.)
