@@ -1,0 +1,17 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata wget \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN groupadd -g 1000 appgroup && \
+    useradd -u 1000 -g appgroup -s /bin/bash -m appuser && \
+    mkdir -p /app/data /app/logs /app/config && \
+    chown -R appuser:appgroup /app
+COPY --chown=appuser:appgroup target/release/ibkr-mcp-rs /app/ibkr-mcp-rs
+COPY --chown=appuser:appgroup config/default.yaml /app/config/default.yaml
+RUN chmod +x /app/ibkr-mcp-rs
+USER appuser
+EXPOSE 8881
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://localhost:8881/health/ready || exit 1
+CMD ["/app/ibkr-mcp-rs"]

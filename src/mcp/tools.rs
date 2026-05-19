@@ -291,6 +291,56 @@ impl IbkrMcpServer {
         }
     }
 
+    /// Get historical executions (fills) with realized P&L
+    #[tool(description = "Get historical trade executions (fills) with realized P&L and commissions. Filter by account, symbol, or time range.")]
+    async fn get_executions(
+        &self,
+        Parameters(params): Parameters<GetExecutionsParams>,
+    ) -> String {
+        let account_id = params.account_id.as_deref();
+        let symbol = params.symbol.as_deref();
+        let since = params.since.as_deref();
+
+        match self.account.get_executions(account_id, symbol, since).await {
+            Ok(executions) => {
+                let total_pnl: f64 = executions.iter().map(|e| e.realized_pnl).sum();
+                let total_commission: f64 = executions.iter().map(|e| e.commission).sum();
+                serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": true,
+                        "totalRealizedPnL": total_pnl,
+                        "totalCommission": total_commission,
+                        "netPnL": total_pnl - total_commission,
+                        "count": executions.len(),
+                        "executions": executions.iter().map(|e| serde_json::json!({
+                            "executionId": e.execution_id,
+                            "symbol": e.symbol,
+                            "securityType": e.security_type,
+                            "side": e.side,
+                            "quantity": e.quantity,
+                            "price": e.price,
+                            "commission": e.commission,
+                            "realizedPnL": e.realized_pnl,
+                            "time": e.time,
+                            "accountId": e.account_id,
+                            "strike": e.strike,
+                            "right": e.right,
+                            "expiration": e.expiration,
+                            "multiplier": e.multiplier,
+                        })).collect::<Vec<_>>(),
+                    })
+                )
+                .unwrap_or_default()
+            }
+            Err(e) => {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"success": false, "error": e.to_string()})
+                )
+                .unwrap_or_default()
+            }
+        }
+    }
+
     /// Get IBKR connection status
     #[tool(description = "Check if the IBKR broker connection is active.")]
     async fn get_connection_status(
@@ -473,6 +523,21 @@ pub struct GetConnectionStatusParams {}
 pub struct GetBulkQuotesParams {
     #[schemars(description = "List of stock symbols, e.g. ['AAPL', 'AMD', 'TSLA']")]
     pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetExecutionsParams {
+    #[schemars(description = "Account ID. Optional — returns all executions if omitted.")]
+    #[serde(default)]
+    pub account_id: Option<String>,
+
+    #[schemars(description = "Symbol filter. Optional — returns all symbols if omitted.")]
+    #[serde(default)]
+    pub symbol: Option<String>,
+
+    #[schemars(description = "Time filter — returns executions since this time. Format: YYYYMMDD-HH:MM:SS. Optional.")]
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

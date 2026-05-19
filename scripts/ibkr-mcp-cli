@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""
+IBKR MCP CLI wrapper — bypasses hermes-agent's broken MCP integration.
+Usage: ibkr-mcp-cli <tool_name> [json_args]
+"""
+import asyncio
+import json
+import sys
+import os
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+URL = os.environ.get("IBKR_MCP_URL", "http://ibkr-mcp:8881/mcp")
+
+
+async def main():
+    if len(sys.argv) < 2:
+        print("Usage: ibkr-mcp-cli <tool_name> [json_args]", file=sys.stderr)
+        sys.exit(1)
+
+    tool = sys.argv[1]
+    args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+
+    async with streamable_http_client(URL) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(tool, args)
+            for c in result.content:
+                print(c.text)
+
+
+asyncio.run(main())

@@ -1,6 +1,7 @@
 use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
 use ibapi::accounts::types::AccountGroup;
 use ibapi::contracts::SecurityType;
+use ibapi::orders::{CommissionReport, ExecutionData, ExecutionFilter, Executions};
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use futures::StreamExt;
 use tokio::time::{timeout, Duration};
@@ -35,6 +36,25 @@ pub struct Position {
     pub unrealized_pnl: f64,
     pub daily_pnl: f64,
     pub security_type: String,
+    pub strike: Option<f64>,
+    pub right: Option<String>,
+    pub expiration: Option<String>,
+    pub multiplier: Option<String>,
+}
+
+/// Execution / fill information
+#[derive(Debug, Clone)]
+pub struct Execution {
+    pub execution_id: String,
+    pub symbol: String,
+    pub security_type: String,
+    pub side: String,
+    pub quantity: f64,
+    pub price: f64,
+    pub commission: f64,
+    pub realized_pnl: f64,
+    pub time: String,
+    pub account_id: String,
     pub strike: Option<f64>,
     pub right: Option<String>,
     pub expiration: Option<String>,
@@ -219,6 +239,98 @@ impl AccountManager {
         }
 
         Ok(positions)
+    }
+
+    /// Get historical executions (fills) with P&L
+    pub async fn get_executions(
+        &self,
+        account_id: Option<&str>,
+        symbol: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<Execution>, IbkrError> {
+        let client = self.client.get_client().await?;
+
+        info!(
+            account_id = account_id.unwrap_or("all"),
+            symbol = symbol.unwrap_or("all"),
+            "Fetching executions"
+        );
+
+        let filter = ExecutionFilter {
+            client_id: None,
+            account_code: account_id.unwrap_or("").to_string(),
+            time: "".to_string(),
+            symbol: symbol.unwrap_or("").to_string(),
+            security_type: "".to_string(),
+            exchange: "".to_string(),
+            side: None,
+            last_n_days: 7,
+            specific_dates: vec![],
+        };
+
+        let mut subscription = client
+            .executions(filter)
+            .await
+            .map_err(|e| IbkrError::Unknown(format!("executions failed: {e}")))?;
+
+        let mut data_stream = subscription.filter_data();
+        let mut executions: std::collections::HashMap<String, Execution> = std::collections::HashMap::new();
+        let collect_timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < collect_timeout {
+            match timeout(Duration::from_millis(500), data_stream.next()).await {
+                Ok(Some(Ok(Executions::ExecutionData(data)))) => {
+                    let is_option = data.contract.security_type == SecurityType::Option;
+                    let exec = Execution {
+                        execution_id: data.execution.execution_id.clone(),
+                        symbol: data.contract.symbol.to_string(),
+                        security_type: data.contract.security_type.to_string(),
+                        side: data.execution.side.clone(),
+                        quantity: data.execution.shares,
+                        price: data.execution.price,
+                        commission: 0.0,
+                        realized_pnl: 0.0,
+                        time: data.execution.time.clone(),
+                        account_id: data.execution.account_number.clone(),
+                        strike: if is_option && data.contract.strike > 0.0 { Some(data.contract.strike) } else { None },
+                        right: data.contract.right.as_ref().map(|r| r.as_str().to_string()),
+                        expiration: if is_option && !data.contract.last_trade_date_or_contract_month.is_empty() {
+                            Some(data.contract.last_trade_date_or_contract_month.clone())
+                        } else {
+                            None
+                        },
+                        multiplier: if is_option && !data.contract.multiplier.is_empty() {
+                            Some(data.contract.multiplier.clone())
+                        } else {
+                            None
+                        },
+                    };
+                    executions.insert(exec.execution_id.clone(), exec);
+                }
+                Ok(Some(Ok(Executions::CommissionReport(report)))) => {
+                    if let Some(exec) = executions.get_mut(&report.execution_id) {
+                        exec.commission = report.commission;
+                        exec.realized_pnl = report.realized_pnl.unwrap_or(0.0);
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    return Err(IbkrError::Unknown(format!(
+                        "executions stream error: {e}"
+                    )));
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if !executions.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<Execution> = executions.into_values().collect();
+        result.sort_by(|a, b| b.time.cmp(&a.time)); // newest first
+        Ok(result)
     }
 }
 
