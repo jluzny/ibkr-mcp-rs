@@ -84,9 +84,16 @@ impl IbkrClient {
         let url = format!("{}:{}", self.config.host, self.config.port);
         let timeout = Duration::from_secs(self.config.connection_timeout_secs);
 
-        info!(url = %url, client_id = self.config.client_id, "Connecting to IBKR");
+        // Use process PID as unique client id when config says 0 (default)
+        let client_id = if self.config.client_id == 0 {
+            std::process::id() as i32
+        } else {
+            self.config.client_id
+        };
 
-        match tokio::time::timeout(timeout, Client::connect(&url, self.config.client_id)).await {
+        info!(url = %url, client_id, "Connecting to IBKR");
+
+        match tokio::time::timeout(timeout, Client::connect(&url, client_id)).await {
             Ok(Ok(client)) => Ok(client),
             Ok(Err(e)) => Err(IbkrError::ConnectionFailed(e.to_string())),
             Err(_) => Err(IbkrError::ConnectionFailed("timeout".into())),

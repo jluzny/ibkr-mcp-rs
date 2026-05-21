@@ -65,7 +65,7 @@ impl Default for Config {
             ibkr: IbkrConfig {
                 host: "127.0.0.1".to_string(),
                 port: 4003,
-                client_id: 100,
+                client_id: 0,
                 paper_trading: true,
                 read_only: true,
                 connection_timeout_secs: 10,
