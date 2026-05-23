@@ -256,15 +256,34 @@ impl AccountManager {
             "Fetching executions"
         );
 
+        // Convert since format: MCP accepts "YYYYMMDD-HH:MM:SS" or "YYYYMMDD",
+        // IBKR API time format: "yyyymmdd hh:mm:ss xx/xxxx" (with timezone)
+        // or "yyyymmdd-hh:mm:ss" (UTC, with dash between date and time).
+        // If no time part given, use start-of-day US/Eastern.
+        let (time_filter, last_n_days) = match since {
+            Some(s) => {
+                let formatted = if s.contains('-') && s.len() >= 9 {
+                    // "20260521-15:30:00" is already in IBKR UTC format (dash = UTC)
+                    // Just pass it through as-is.
+                    s.to_string()
+                } else {
+                    // "20260521" -> "20260521-00:00:00" (UTC dash format for start of day)
+                    format!("{}-00:00:00", s)
+                };
+                (formatted, 7) // keep last_n_days=7 alongside time filter
+            }
+            None => (String::new(), 7), // default: last 7 days
+        };
+
         let filter = ExecutionFilter {
             client_id: None,
             account_code: account_id.unwrap_or("").to_string(),
-            time: "".to_string(),
+            time: time_filter,
             symbol: symbol.unwrap_or("").to_string(),
             security_type: "".to_string(),
             exchange: "".to_string(),
             side: None,
-            last_n_days: 7,
+            last_n_days,
             specific_dates: vec![],
         };
 
@@ -329,7 +348,21 @@ impl AccountManager {
         }
 
         let mut result: Vec<Execution> = executions.into_values().collect();
-        result.sort_by(|a, b| b.time.cmp(&a.time)); // newest first
+        result.sort_by(|a, b| b.time.cmp(&a.time));
+
+        // Client-side since filter — IBKR API may not reliably filter server-side.
+        // Time formats from IBKR vary: "20260521 15:28:44 US/Eastern" or "20260521 19:28:44 Africa/Abidjan"
+        // We normalize to YYYYMMDD for comparison.
+        if let Some(since) = since {
+            // Normalize since to YYYYMMDD (8 chars)
+            let since_date: String = since.chars().take(8).collect();
+            result.retain(|e| {
+                // IBKR time format starts with YYYYMMDD, possibly followed by space/timezone
+                let exec_date: String = e.time.chars().take(8).collect();
+                exec_date >= since_date
+            });
+        }
+
         Ok(result)
     }
 }

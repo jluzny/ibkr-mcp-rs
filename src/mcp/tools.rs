@@ -535,7 +535,7 @@ pub struct GetExecutionsParams {
     #[serde(default)]
     pub symbol: Option<String>,
 
-    #[schemars(description = "Time filter — returns executions since this time. Format: YYYYMMDD-HH:MM:SS. Optional.")]
+    #[schemars(description = "Time filter — returns executions since this time. Format: YYYYMMDD (e.g. \"20260521\") or YYYYMMDD-HH:MM:SS in UTC (e.g. \"20260521-15:30:00\"). Optional.")]
     #[serde(default)]
     pub since: Option<String>,
 }
