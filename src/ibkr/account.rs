@@ -17,6 +17,7 @@ pub struct AccountInfo {
     pub account_id: String,
     pub net_liquidation: f64,
     pub available_funds: f64,
+    pub excess_liquidity: f64,
     pub buying_power: f64,
     pub currency: String,
     pub daily_pnl: f64,
@@ -100,6 +101,7 @@ impl AccountManager {
         let tags = &[
             AccountSummaryTags::NET_LIQUIDATION,
             AccountSummaryTags::AVAILABLE_FUNDS,
+            AccountSummaryTags::EXCESS_LIQUIDITY,
             AccountSummaryTags::BUYING_POWER,
             AccountSummaryTags::TOTAL_CASH_VALUE,
             AccountSummaryTags::GROSS_POSITION_VALUE,
@@ -160,6 +162,7 @@ impl AccountManager {
             account_id,
             net_liquidation: parse_f64(&get(AccountSummaryTags::NET_LIQUIDATION)),
             available_funds: parse_f64(&get(AccountSummaryTags::AVAILABLE_FUNDS)),
+            excess_liquidity: parse_f64(&get(AccountSummaryTags::EXCESS_LIQUIDITY)),
             buying_power: parse_f64(&get(AccountSummaryTags::BUYING_POWER)),
             currency: "USD".to_string(),
             daily_pnl: 0.0,

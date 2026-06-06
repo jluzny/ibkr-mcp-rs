@@ -232,6 +232,7 @@ impl IbkrMcpServer {
                         "accountId": info.account_id,
                         "netLiquidation": info.net_liquidation,
                         "availableFunds": info.available_funds,
+                        "excessLiquidity": info.excess_liquidity,
                         "buyingPower": info.buying_power,
                         "currency": info.currency,
                         "dailyPnL": info.daily_pnl,

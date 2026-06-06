@@ -49,8 +49,8 @@ pub async fn start_http_on(
     ct: CancellationToken,
 ) -> anyhow::Result<()> {
     let http_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
-        .with_json_response(true)
+        .with_stateful_mode(true)
+        .with_json_response(false)
         .with_cancellation_token(ct.child_token())
         .disable_allowed_hosts();
     start_http_on_with_config(listener, client, http_config, ct).await
