@@ -108,7 +108,7 @@ impl AccountManager {
             AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
         ];
 
-        let mut subscription = client
+        let subscription = client
             .account_summary(&AccountGroup("All".to_string()), tags)
             .await
             .map_err(|e| IbkrError::Unknown(format!("account_summary failed: {e}")))?;
@@ -116,7 +116,7 @@ impl AccountManager {
         let mut values: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
 
-        let mut data_stream = subscription.filter_data();
+        let mut data_stream = subscription.clone().filter_data();
         let collect_timeout = Duration::from_secs(5);
         let start = std::time::Instant::now();
 
@@ -134,6 +134,7 @@ impl AccountManager {
                 }
                 Ok(Some(Ok(AccountSummaryResult::End))) => break,
                 Ok(Some(Err(e))) => {
+                    subscription.cancel().await;
                     return Err(IbkrError::Unknown(format!(
                         "account_summary stream error: {e}"
                     )));
@@ -146,6 +147,12 @@ impl AccountManager {
                 }
             }
         }
+
+        // Explicitly cancel the subscription so TWS releases it.
+        // Relying on Drop's fire-and-forget tokio::spawn races with
+        // the next cron tick and causes "max account summary requests
+        // exceeded" after ~3 calls.
+        subscription.cancel().await;
 
         if values.is_empty() {
             return Err(IbkrError::Unknown(
@@ -184,12 +191,12 @@ impl AccountManager {
             "Fetching positions"
         );
 
-        let mut subscription = client
+        let subscription = client
             .positions()
             .await
             .map_err(|e| IbkrError::Unknown(format!("positions failed: {e}")))?;
 
-        let mut data_stream = subscription.filter_data();
+        let mut data_stream = subscription.clone().filter_data();
         let mut positions = Vec::new();
         let collect_timeout = Duration::from_secs(5);
         let start = std::time::Instant::now();
@@ -228,6 +235,7 @@ impl AccountManager {
                 }
                 Ok(Some(Ok(PositionUpdate::PositionEnd))) => break,
                 Ok(Some(Err(e))) => {
+                    subscription.cancel().await;
                     return Err(IbkrError::Unknown(format!(
                         "positions stream error: {e}"
                     )));
@@ -240,6 +248,11 @@ impl AccountManager {
                 }
             }
         }
+
+        // Explicitly cancel the positions subscription so TWS releases it.
+        // Same race condition as account_summary — Drop's fire-and-forget
+        // tokio::spawn may not complete before the next request.
+        subscription.cancel().await;
 
         Ok(positions)
     }
@@ -290,7 +303,7 @@ impl AccountManager {
             specific_dates: vec![],
         };
 
-        let mut subscription = client
+        let subscription = client
             .executions(filter)
             .await
             .map_err(|e| IbkrError::Unknown(format!("executions failed: {e}")))?;
@@ -308,7 +321,7 @@ impl AccountManager {
                         execution_id: data.execution.execution_id.clone(),
                         symbol: data.contract.symbol.to_string(),
                         security_type: data.contract.security_type.to_string(),
-                        side: data.execution.side.clone(),
+                        side: data.execution.side.as_str().to_string(),
                         quantity: data.execution.shares,
                         price: data.execution.price,
                         commission: 0.0,
