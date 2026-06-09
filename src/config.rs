@@ -68,9 +68,9 @@ impl Default for Config {
                 client_id: 0,
                 paper_trading: true,
                 read_only: true,
-                connection_timeout_secs: 10,
+                connection_timeout_secs: 15,
                 retry_attempts: 100,
-                retry_delay_ms: 500,
+                retry_delay_ms: 1000,
             },
             mcp: McpConfig {
                 host: "0.0.0.0".to_string(),

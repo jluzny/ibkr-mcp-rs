@@ -42,7 +42,8 @@ impl IbkrClient {
     pub fn connect(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut attempts: u32 = 0;
-            let max_delay = Duration::from_secs(15);
+            let max_delay = Duration::from_secs(60);
+            let max_attempts_before_stall = 10;
 
             loop {
                 let delay = Self::backoff(attempts, max_delay);
@@ -56,12 +57,35 @@ impl IbkrClient {
                 }
                 attempts += 1;
 
+                // Stall the retry loop after many consecutive failures to avoid
+                // hammering the gateway (e.g. during 2FA or IBKR maintenance).
+                if attempts > max_attempts_before_stall {
+                    let stall = Duration::from_secs(30);
+                    warn!(stall_secs = stall.as_secs(), "Connection flapping detected, backing off");
+                    sleep(stall).await;
+                }
+
+                // Pre-flight: verify the TCP endpoint is actually accepting connections.
+                // Using Client::connect on a dead socket may return early eof from socat
+                // when the IBKR API isn't yet listening (startup / 2FA / relogin).
+                let target = format!("{}:{}", self.config.host, self.config.port);
+                match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&target)).await {
+                    Ok(Ok(_socket)) => {
+                        // TCP is open — now attempt the IBKR handshake
+                        drop(_socket);
+                    }
+                    _ => {
+                        warn!(attempt = attempts, target = %target, "IBKR TCP endpoint not ready, skipping handshake attempt");
+                        continue;
+                    }
+                }
+
                 match self.try_connect_once().await {
                     Ok(client) => {
                         let mut guard = self.inner.write().await;
                         // Gracefully shut down old client if any
                         if let Some(old) = guard.take() {
-            old.disconnect().await;
+                            old.disconnect().await;
                         }
                         *guard = Some(Arc::new(client));
                         drop(guard);

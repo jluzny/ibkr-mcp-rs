@@ -7,9 +7,9 @@ ibkr:
   client_id: 100    # Unique client ID for this MCP server
   paper_trading: false
   read_only: true
-  connection_timeout_secs: 10
+  connection_timeout_secs: 15
   retry_attempts: 100
-  retry_delay_ms: 500
+  retry_delay_ms: 1000
 
 # MCP server settings
 mcp:
