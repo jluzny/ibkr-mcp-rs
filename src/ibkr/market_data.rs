@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use ibapi::prelude::*;
-use ibapi::market_data::realtime::TickType;
+use ibapi::contracts::tick_types::TickType;
 use ibapi::market_data::MarketDataType;
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use futures::StreamExt;
@@ -40,10 +40,12 @@ pub struct CachedQuote {
 pub enum QuoteSource {
     RealTime,
     Delayed,
+    Frozen,
+    DelayedFrozen,
     Cache,
 }
 
-/// Market data manager with caching and delayed fallback
+/// Market data manager with caching and automatic fallback to frozen/delayed data
 #[derive(Debug)]
 pub struct MarketDataManager {
     client: Arc<IbkrClient>,
@@ -63,7 +65,7 @@ impl MarketDataManager {
     }
 
     /// Get a quote for a symbol. Checks cache first, then fetches from IBKR
-    /// with automatic delayed fallback on entitlement errors.
+    /// with automatic cascade: Realtime → Frozen → DelayedFrozen → Delayed.
     pub async fn get_quote(&self,
         symbol: &str,
     ) -> Result<CachedQuote, IbkrError> {
@@ -73,6 +75,7 @@ impl MarketDataManager {
         if let Some(entry) = self.cache.get(&symbol) {
             let ttl = match entry.source {
                 QuoteSource::RealTime => Duration::from_secs(self.config.real_time_ttl_secs),
+                QuoteSource::Frozen => Duration::from_secs(self.config.frozen_ttl_secs),
                 _ => Duration::from_secs(self.config.delayed_ttl_secs),
             };
             if entry.timestamp.elapsed() < ttl {
@@ -81,46 +84,62 @@ impl MarketDataManager {
             }
         }
 
-        // Try real-time first, delayed if marked or on entitlement error
-        let use_delayed = self.delayed_symbols.contains_key(&symbol);
+        let is_delayed_symbol = self.delayed_symbols.contains_key(&symbol);
 
-        match self.fetch_quote(&symbol, use_delayed).await {
-            Ok(quote) => {
-                self.cache.insert(symbol.clone(), quote.clone());
-                Ok(quote)
-            }
-            Err(IbkrError::MarketDataSubscriptionRequired { code, .. }) => {
-                warn!(symbol = %symbol, code = code, "Entitlement error, retrying with delayed data");
-                self.delayed_symbols.insert(symbol.clone(), ());
-
-                let quote = self.fetch_quote(&symbol, true).await?;
-                self.cache.insert(symbol.clone(), quote.clone());
-                Ok(quote)
-            }
-            Err(e) => Err(e),
+        // Build the cascade. If we already know this symbol requires delayed data,
+        // skip Realtime and Frozen to avoid entitlement errors.
+        let mut types_to_try = Vec::new();
+        if !is_delayed_symbol {
+            types_to_try.push(MarketDataType::Realtime);
+            types_to_try.push(MarketDataType::Frozen);
         }
+        types_to_try.push(MarketDataType::DelayedFrozen);
+        types_to_try.push(MarketDataType::Delayed);
+
+        for md_type in types_to_try {
+            match self.fetch_quote(&symbol, md_type).await {
+                Ok(quote) => {
+                    self.cache.insert(symbol.clone(), quote.clone());
+                    return Ok(quote);
+                }
+                Err(IbkrError::MarketDataSubscriptionRequired { code, .. }) => {
+                    if md_type == MarketDataType::Realtime || md_type == MarketDataType::Frozen {
+                        warn!(symbol = %symbol, code = code, "Entitlement error on realtime/frozen, will use delayed data going forward");
+                        self.delayed_symbols.insert(symbol.clone(), ());
+                    }
+                    // Continue to next type in cascade
+                }
+                Err(IbkrError::MarketDataUnavailable(_)) => {
+                    // No data for this type (e.g. market closed + no frozen data),
+                    // continue to next type in cascade.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(IbkrError::MarketDataUnavailable(
+            format!("No market data received for {} after trying all market data types", symbol),
+        ))
     }
 
-    /// Fetch quote via IBKR market data snapshot subscription
+    /// Fetch quote via IBKR market data snapshot subscription for a specific MarketDataType.
     async fn fetch_quote(
         &self,
         symbol: &str,
-        use_delayed: bool,
+        md_type: MarketDataType,
     ) -> Result<CachedQuote, IbkrError> {
         let client = self.client.get_client().await?;
         let contract = Contract::stock(symbol).build();
 
-        info!(symbol = %symbol, delayed = use_delayed, "Fetching market data snapshot");
+        info!(symbol = %symbol, ?md_type, "Fetching market data snapshot");
 
-        // Switch to delayed market data type if requested
-        if use_delayed {
-            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Delayed).await {
-                warn!(symbol = %symbol, error = %e, "Failed to switch to delayed market data type");
+        // Switch to requested market data type (skip for Realtime — already default)
+        if md_type != MarketDataType::Realtime {
+            if let Err(e) = client.switch_market_data_type(md_type).await {
+                warn!(symbol = %symbol, error = %e, "Failed to switch market data type");
             }
         }
 
-        // In ibapi v3, market data is always subscription-based.
-        // Use `.snapshot()` for a one-time request that auto-cancels after first tick.
         let mut subscription = client
             .market_data(&contract)
             .snapshot()
@@ -138,7 +157,7 @@ impl MarketDataManager {
             low: 0.0,
             close: 0.0,
             timestamp: Instant::now(),
-            source: if use_delayed { QuoteSource::Delayed } else { QuoteSource::RealTime },
+            source: market_data_type_to_source(md_type),
         };
 
         let mut got_data = false;
@@ -220,12 +239,7 @@ impl MarketDataManager {
                     break;
                 }
                 Ok(SubscriptionItem::Data(TickTypes::MarketDataType(dt))) => {
-                    // Track whether we got delayed or real-time data
-                    quote.source = match dt {
-                        MarketDataType::Delayed => QuoteSource::Delayed,
-                        MarketDataType::DelayedFrozen => QuoteSource::Delayed,
-                        _ => quote.source,
-                    };
+                    quote.source = market_data_type_to_source(dt);
                 }
                 Ok(SubscriptionItem::Notice(notice)) => {
                     if is_entitlement_error(notice.code) {
@@ -238,7 +252,6 @@ impl MarketDataManager {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    // Entitlement errors come as Err, not as Notice
                     if let Some(code) = extract_error_code(&err_str) {
                         if is_entitlement_error(code) {
                             return Err(IbkrError::MarketDataSubscriptionRequired {
@@ -251,23 +264,18 @@ impl MarketDataManager {
                 }
                 _ => {}
             }
-
-            if got_data {
-                // We got at least a price tick, can return early
-                // or wait for SnapshotEnd for completeness
-            }
         }
 
-        // Switch back to real-time after delayed request
-        if use_delayed {
-            if let Err(e) = client.switch_market_data_type(ibapi::market_data::MarketDataType::Realtime).await {
+        // Switch back to real-time after non-realtime request
+        if md_type != MarketDataType::Realtime {
+            if let Err(e) = client.switch_market_data_type(MarketDataType::Realtime).await {
                 warn!(symbol = %symbol, error = %e, "Failed to switch back to real-time market data type");
             }
         }
 
         if !got_data {
             return Err(IbkrError::MarketDataUnavailable(
-                "No market data received".to_string(),
+                format!("No market data received for {} with {:?}", symbol, md_type),
             ));
         }
 
@@ -332,7 +340,6 @@ impl MarketDataManager {
 
         info!(symbol = %symbol, "Fetching option chain via sec_def_opt_params");
 
-        // Use ibapi v3's option_chain() which sends reqSecDefOptParams
         let mut subscription = client
             .option_chain(symbol, "SMART", SecurityType::Stock, 0)
             .await
@@ -372,7 +379,7 @@ impl MarketDataManager {
     }
 
     /// Fetch a market data snapshot for an option contract.
-    /// Shares the same caching/delayed-fallback logic as get_quote.
+    /// Uses the same Realtime → Frozen → DelayedFrozen → Delayed cascade as stock quotes.
     pub async fn get_option_quote(
         &self,
         contract: &ibapi::contracts::Contract,
@@ -382,21 +389,49 @@ impl MarketDataManager {
 
         // Check cache
         if let Some(entry) = self.cache.get(&cache_key) {
-            let ttl = Duration::from_secs(self.config.real_time_ttl_secs);
+            let ttl = match entry.source {
+                QuoteSource::RealTime => Duration::from_secs(self.config.real_time_ttl_secs),
+                QuoteSource::Frozen => Duration::from_secs(self.config.frozen_ttl_secs),
+                _ => Duration::from_secs(self.config.delayed_ttl_secs),
+            };
             if entry.timestamp.elapsed() < ttl {
                 info!(cache_key = %cache_key, source = ?entry.source, "Cache hit");
                 return Ok(entry.clone());
             }
         }
 
-        let use_delayed = self.delayed_symbols.contains_key(&cache_key);
+        let is_delayed_symbol = self.delayed_symbols.contains_key(&cache_key);
 
-        // Use the internal fetch method but with a custom contract
-        // We need a variant that accepts an arbitrary Contract. Since fetch_quote
-        // builds Contract::stock() internally, we add a parallel path here.
-        let quote = self.fetch_option_quote(contract, &cache_key, use_delayed).await?;
-        self.cache.insert(cache_key.clone(), quote.clone());
-        Ok(quote)
+        let mut types_to_try = Vec::new();
+        if !is_delayed_symbol {
+            types_to_try.push(MarketDataType::Realtime);
+            types_to_try.push(MarketDataType::Frozen);
+        }
+        types_to_try.push(MarketDataType::DelayedFrozen);
+        types_to_try.push(MarketDataType::Delayed);
+
+        for md_type in types_to_try {
+            match self.fetch_option_quote(contract, &cache_key, md_type).await {
+                Ok(quote) => {
+                    self.cache.insert(cache_key.clone(), quote.clone());
+                    return Ok(quote);
+                }
+                Err(IbkrError::MarketDataSubscriptionRequired { code, .. }) => {
+                    if md_type == MarketDataType::Realtime || md_type == MarketDataType::Frozen {
+                        warn!(label = %cache_key, code = code, "Entitlement error on realtime/frozen, will use delayed data going forward");
+                        self.delayed_symbols.insert(cache_key.clone(), ());
+                    }
+                }
+                Err(IbkrError::MarketDataUnavailable(_)) => {
+                    // Continue cascade
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(IbkrError::MarketDataUnavailable(
+            format!("No market data received for {} after trying all market data types", cache_key),
+        ))
     }
 
     /// Internal: snapshot market data for an arbitrary contract (options, etc.)
@@ -404,15 +439,15 @@ impl MarketDataManager {
         &self,
         contract: &ibapi::contracts::Contract,
         label: &str,
-        use_delayed: bool,
+        md_type: MarketDataType,
     ) -> Result<CachedQuote, IbkrError> {
         let client = self.client.get_client().await?;
 
-        info!(label = %label, delayed = use_delayed, "Fetching option market data snapshot");
+        info!(label = %label, ?md_type, "Fetching option market data snapshot");
 
-        if use_delayed {
-            if let Err(e) = client.switch_market_data_type(MarketDataType::Delayed).await {
-                warn!(label = %label, error = %e, "Failed to switch to delayed market data type");
+        if md_type != MarketDataType::Realtime {
+            if let Err(e) = client.switch_market_data_type(md_type).await {
+                warn!(label = %label, error = %e, "Failed to switch market data type");
             }
         }
 
@@ -433,7 +468,7 @@ impl MarketDataManager {
             low: 0.0,
             close: 0.0,
             timestamp: Instant::now(),
-            source: if use_delayed { QuoteSource::Delayed } else { QuoteSource::RealTime },
+            source: market_data_type_to_source(md_type),
         };
 
         let mut got_data = false;
@@ -481,10 +516,7 @@ impl MarketDataManager {
                     break;
                 }
                 Ok(SubscriptionItem::Data(TickTypes::MarketDataType(dt))) => {
-                    quote.source = match dt {
-                        MarketDataType::Delayed | MarketDataType::DelayedFrozen => QuoteSource::Delayed,
-                        _ => quote.source,
-                    };
+                    quote.source = market_data_type_to_source(dt);
                 }
                 Ok(SubscriptionItem::Notice(notice)) => {
                     if is_entitlement_error(notice.code) {
@@ -511,7 +543,7 @@ impl MarketDataManager {
             }
         }
 
-        if use_delayed {
+        if md_type != MarketDataType::Realtime {
             if let Err(e) = client.switch_market_data_type(MarketDataType::Realtime).await {
                 warn!(label = %label, error = %e, "Failed to switch back to real-time");
             }
@@ -519,12 +551,23 @@ impl MarketDataManager {
 
         if !got_data {
             return Err(IbkrError::MarketDataUnavailable(
-                "No market data received".to_string(),
+                format!("No market data received for {} with {:?}", label, md_type),
             ));
         }
 
         quote.timestamp = Instant::now();
         Ok(quote)
+    }
+}
+
+/// Convert IBKR MarketDataType to our QuoteSource enum
+fn market_data_type_to_source(md_type: MarketDataType) -> QuoteSource {
+    match md_type {
+        MarketDataType::Realtime => QuoteSource::RealTime,
+        MarketDataType::Frozen => QuoteSource::Frozen,
+        MarketDataType::Delayed => QuoteSource::Delayed,
+        MarketDataType::DelayedFrozen => QuoteSource::DelayedFrozen,
+        _ => QuoteSource::RealTime,
     }
 }
 

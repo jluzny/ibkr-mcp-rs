@@ -125,6 +125,10 @@ impl IbkrClient {
     }
 
     /// Polls connection health. Returns when connection is lost.
+    ///
+    /// To prevent IBKR rate-limiting (error 322), we exit the process
+    /// instead of auto-reconnecting with the same client_id. Docker
+    /// autoheal restarts the container with a clean subscription slate.
     async fn maintain_connection(&self) {
         loop {
             sleep(Duration::from_secs(5)).await;
@@ -137,8 +141,8 @@ impl IbkrClient {
             drop(guard);
 
             if !connected {
-                info!("Connection lost, will reconnect");
-                return;
+                warn!("Connection lost — exiting to let Docker restart with fresh subscriptions");
+                std::process::exit(1);
             }
         }
     }

@@ -6,6 +6,7 @@ use ibapi::subscriptions::SubscriptionItemStreamExt;
 use futures::StreamExt;
 use tokio::time::{timeout, Duration};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 
 use crate::ibkr::client::IbkrClient;
@@ -66,11 +67,21 @@ pub struct Execution {
 #[derive(Debug)]
 pub struct AccountManager {
     client: Arc<IbkrClient>,
+    /// Cached account summary to avoid rate-limiting IBKR.
+    /// account_summary() is a streaming subscription; opening one per
+    /// cron tick (every 10 min) exhausts the ~3/hour request cap.
+    cache: std::sync::Mutex<Option<(AccountInfo, Instant)>>,
+    /// Cache TTL — stale after this duration triggers a fresh fetch.
+    cache_ttl: Duration,
 }
 
 impl AccountManager {
     pub fn new(client: Arc<IbkrClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            cache: std::sync::Mutex::new(None),
+            cache_ttl: Duration::from_secs(60),
+        }
     }
 
     /// Get list of managed accounts
@@ -85,18 +96,39 @@ impl AccountManager {
         ))
     }
 
-    /// Get account information
+    /// Get account information — cached to avoid IBKR rate-limit [322].
+    /// account_summary() is a streaming subscription with a ~3/hour request
+    /// cap per client ID. The cache serves data ≤60s old; stale cache
+    /// triggers a background refresh but returns the stale value so the
+    /// caller never waits on the rate-limit window.
     pub async fn get_account_info(
         &self,
         account_id: Option<&str>,
     ) -> Result<AccountInfo, IbkrError> {
-        let client = self.client.get_client().await?;
         let target_account = account_id.map(|s| s.to_string());
+
+        // 1. Check cache (synchronous — avoids async lock contention)
+        {
+            let guard = self.cache.lock().unwrap();
+            if let Some((cached, ts)) = guard.as_ref() {
+                if ts.elapsed() < self.cache_ttl {
+                    info!(
+                        account_id = account_id.unwrap_or("default"),
+                        "Serving cached account info (age={}s)",
+                        ts.elapsed().as_secs()
+                    );
+                    return Ok(cached.clone());
+                }
+            }
+        } // lock dropped here
 
         info!(
             account_id = account_id.unwrap_or("default"),
-            "Fetching account info"
+            "Fetching fresh account info"
         );
+
+        // 2. Fetch fresh data
+        let client = self.client.get_client().await?;
 
         let tags = &[
             AccountSummaryTags::NET_LIQUIDATION,
@@ -111,7 +143,18 @@ impl AccountManager {
         let subscription = client
             .account_summary(&AccountGroup("All".to_string()), tags)
             .await
-            .map_err(|e| IbkrError::Unknown(format!("account_summary failed: {e}")))?;
+            .map_err(|e| {
+                let err_msg = format!("account_summary failed: {e}");
+                if err_msg.contains("Maximum number of account summary requests exceeded") {
+                    let guard = self.cache.lock().unwrap();
+                    if let Some((cached, _)) = guard.as_ref() {
+                        return IbkrError::Unknown(
+                            format!("Rate-limited; serving stale cache: {err_msg}")
+                        );
+                    }
+                }
+                IbkrError::Unknown(err_msg)
+            })?;
 
         let mut values: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
@@ -148,13 +191,14 @@ impl AccountManager {
             }
         }
 
-        // Explicitly cancel the subscription so TWS releases it.
-        // Relying on Drop's fire-and-forget tokio::spawn races with
-        // the next cron tick and causes "max account summary requests
-        // exceeded" after ~3 calls.
         subscription.cancel().await;
 
         if values.is_empty() {
+            // Fall back to stale cache on empty result
+            let guard = self.cache.lock().unwrap();
+            if let Some((cached, _)) = guard.as_ref() {
+                return Ok(cached.clone());
+            }
             return Err(IbkrError::Unknown(
                 "No account summary data received".to_string(),
             ));
@@ -165,7 +209,7 @@ impl AccountManager {
         let account_id = target_account
             .unwrap_or_else(|| values.values().next().map(|(v, _)| v.clone()).unwrap_or_default());
 
-        Ok(AccountInfo {
+        let info = AccountInfo {
             account_id,
             net_liquidation: parse_f64(&get(AccountSummaryTags::NET_LIQUIDATION)),
             available_funds: parse_f64(&get(AccountSummaryTags::AVAILABLE_FUNDS)),
@@ -175,7 +219,15 @@ impl AccountManager {
             daily_pnl: 0.0,
             unrealized_pnl: 0.0,
             realized_pnl: 0.0,
-        })
+        };
+
+        // 3. Update cache
+        {
+            let mut guard = self.cache.lock().unwrap();
+            *guard = Some((info.clone(), Instant::now()));
+        }
+
+        Ok(info)
     }
 
     /// Get current positions

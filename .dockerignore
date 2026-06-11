@@ -1,0 +1,33 @@
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Git
+target2/
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Tests / docs we don't need in the image
+PLAN-*.md
+PLAN-*.txt
+tests/
+
+# Misc
+*.bak
+*.tmp
+node_modules/
+
+# Binary artifacts we might copy manually
+*.exe
+*.dll
+*.so

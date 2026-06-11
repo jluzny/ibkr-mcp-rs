@@ -50,6 +50,7 @@ pub struct McpConfig {
 pub struct MarketDataConfig {
     pub real_time_ttl_secs: u64,
     pub delayed_ttl_secs: u64,
+    pub frozen_ttl_secs: u64,
     pub max_cache_entries: usize,
 }
 
@@ -80,6 +81,7 @@ impl Default for Config {
             market_data: MarketDataConfig {
                 real_time_ttl_secs: 5,
                 delayed_ttl_secs: 60,
+                frozen_ttl_secs: 300,
                 max_cache_entries: 1000,
             },
             logging: LoggingConfig {

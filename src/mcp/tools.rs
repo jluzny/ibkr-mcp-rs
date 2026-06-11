@@ -31,6 +31,7 @@ use crate::ibkr::error::IbkrError;
 use crate::ibkr::market_data::{MarketDataManager, QuoteSource};
 use crate::ibkr::account::AccountManager;
 use crate::ibkr::orders::OrderManager;
+use crate::ibkr::orders::WhatIfRequest;
 
 /// MCP server state — holds all IBKR managers and routes tool calls.
 ///
@@ -118,6 +119,8 @@ impl IbkrMcpServer {
                             source: match quote.source {
                                 QuoteSource::RealTime => "realtime".to_string(),
                                 QuoteSource::Delayed => "delayed".to_string(),
+                                QuoteSource::Frozen => "frozen".to_string(),
+                                QuoteSource::DelayedFrozen => "delayed_frozen".to_string(),
                                 QuoteSource::Cache => "cache".to_string(),
                             },
                             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -201,6 +204,8 @@ impl IbkrMcpServer {
                     "source": match quote.source {
                         QuoteSource::RealTime => "realtime",
                         QuoteSource::Delayed => "delayed",
+                        QuoteSource::Frozen => "frozen",
+                        QuoteSource::DelayedFrozen => "delayed_frozen",
                         QuoteSource::Cache => "cache",
                     },
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -454,6 +459,8 @@ impl IbkrMcpServer {
                     "source": match quote.source {
                         QuoteSource::RealTime => "realtime",
                         QuoteSource::Delayed => "delayed",
+                        QuoteSource::Frozen => "frozen",
+                        QuoteSource::DelayedFrozen => "delayed_frozen",
                         QuoteSource::Cache => "cache",
                     },
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -475,6 +482,67 @@ impl IbkrMcpServer {
             }
         }
     }
+
+    /// Preview margin/equity/commission impact without executing
+    #[tool(description = "Preview margin, equity, and commission impact of a hypothetical order without executing it. Use to check if a sale will release maintenance margin before committing.")]
+    async fn what_if(
+        &self,
+        Parameters(params): Parameters<WhatIfParams>,
+    ) -> String {
+        let req = WhatIfRequest {
+            symbol: params.symbol.to_uppercase(),
+            action: params.action.to_uppercase(),
+            quantity: params.quantity,
+            order_type: params.order_type.to_uppercase(),
+            price: params.price,
+        };
+
+        match self.orders.what_if_order(req).await {
+            Ok(result) => {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": true,
+                        "symbol": result.symbol,
+                        "action": result.action,
+                        "quantity": result.quantity,
+                        "orderType": result.order_type,
+                        "status": result.status,
+                        "initialMarginBefore": result.initial_margin_before,
+                        "initialMarginChange": result.initial_margin_change,
+                        "initialMarginAfter": result.initial_margin_after,
+                        "maintenanceMarginBefore": result.maintenance_margin_before,
+                        "maintenanceMarginChange": result.maintenance_margin_change,
+                        "maintenanceMarginAfter": result.maintenance_margin_after,
+                        "equityWithLoanBefore": result.equity_with_loan_before,
+                        "equityWithLoanChange": result.equity_with_loan_change,
+                        "equityWithLoanAfter": result.equity_with_loan_after,
+                        "commission": result.commission,
+                        "minimumCommission": result.minimum_commission,
+                        "maximumCommission": result.maximum_commission,
+                        "commissionCurrency": result.commission_currency,
+                        "suggestedSize": result.suggested_size,
+                        "warningText": result.warning_text,
+                        "rejectReason": result.reject_reason,
+                    })
+                )
+                .unwrap_or_default()
+            }
+            Err(e) => {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({
+                        "success": false,
+                        "symbol": params.symbol,
+                        "error": e.to_string(),
+                    })
+                )
+                .unwrap_or_default()
+            }
+        }
+    }
+}
+
+fn default_mkt() -> String {
+    "MKT".to_string()
 }
 
 fn default_quote() -> String {
@@ -560,6 +628,30 @@ pub struct GetOptionQuoteParams {
 
     #[schemars(description = "Option right: 'C' for Call or 'P' for Put")]
     pub right: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WhatIfParams {
+    #[schemars(description = "Stock symbol, e.g. BTDR, IBIT")]
+    pub symbol: String,
+
+    #[schemars(description = "Order action: 'SELL' or 'BUY'")]
+    pub action: String,
+
+    #[schemars(description = "Number of shares")]
+    pub quantity: f64,
+
+    #[schemars(description = "Order type: 'MKT' or 'LMT'. Defaults to 'MKT'.")]
+    #[serde(default = "default_mkt")]
+    pub order_type: String,
+
+    #[schemars(description = "Limit price. Required only if order_type is 'LMT'.")]
+    #[serde(default)]
+    pub price: Option<f64>,
+
+    #[schemars(description = "Account ID. Optional — uses default if omitted.")]
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 // ============================================================================
