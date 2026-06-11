@@ -80,7 +80,11 @@ impl AccountManager {
         Self {
             client,
             cache: std::sync::Mutex::new(None),
-            cache_ttl: Duration::from_secs(60),
+            // account_summary() is a streaming subscription with a hard cap of
+            // ~3 concurrent requests per client ID. A short TTL (60s) causes
+            // rate-limit [322] under any moderate load. 5 min is safe for
+            // account snapshots; positions/quotes have separate endpoints.
+            cache_ttl: Duration::from_secs(300),
         }
     }
 
@@ -140,24 +144,38 @@ impl AccountManager {
             AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
         ];
 
-        let subscription = client
-            .account_summary(&AccountGroup("All".to_string()), tags)
-            .await
-            .map_err(|e| {
-                let err_msg = format!("account_summary failed: {e}");
-                if err_msg.contains("Maximum number of account summary requests exceeded") {
-                    let guard = self.cache.lock().unwrap();
-                    if let Some((cached, _)) = guard.as_ref() {
-                        return IbkrError::Unknown(
-                            format!("Rate-limited; serving stale cache: {err_msg}")
-                        );
-                    }
+        let subscription = timeout(
+            Duration::from_secs(10),
+            client.account_summary(&AccountGroup("All".to_string()), tags)
+        )
+        .await
+        .map_err(|e| {
+            // On timeout, try to serve stale cache
+            let guard = self.cache.lock().unwrap();
+            if let Some((cached, _)) = guard.as_ref() {
+                return IbkrError::Unknown(
+                    format!("Timeout; serving stale cache: {e}")
+                );
+            }
+            IbkrError::Unknown(format!("account_summary timeout: {e}"))
+        })?
+        .map_err(|e| {
+            let err_msg = format!("account_summary failed: {e}");
+            if err_msg.contains("Maximum number of account summary requests exceeded") {
+                let guard = self.cache.lock().unwrap();
+                if let Some((cached, _)) = guard.as_ref() {
+                    return IbkrError::Unknown(
+                        format!("Rate-limited; serving stale cache: {err_msg}")
+                    );
                 }
-                IbkrError::Unknown(err_msg)
-            })?;
+            }
+            IbkrError::Unknown(err_msg)
+        })?;
 
         let mut values: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
+
+        let mut account_id: Option<String> = None;
 
         let mut data_stream = subscription.clone().filter_data();
         let collect_timeout = Duration::from_secs(5);
@@ -166,6 +184,9 @@ impl AccountManager {
         while start.elapsed() < collect_timeout {
             match timeout(Duration::from_millis(500), data_stream.next()).await {
                 Ok(Some(Ok(AccountSummaryResult::Summary(summary)))) => {
+                    if account_id.is_none() {
+                        account_id = Some(summary.account.clone());
+                    }
                     if target_account.is_none()
                         || target_account.as_ref() == Some(&summary.account)
                     {
@@ -206,8 +227,7 @@ impl AccountManager {
 
         let get = |tag: &str| values.get(tag).map(|(v, _)| v.clone()).unwrap_or_default();
 
-        let account_id = target_account
-            .unwrap_or_else(|| values.values().next().map(|(v, _)| v.clone()).unwrap_or_default());
+        let account_id = account_id.unwrap_or_default();
 
         let info = AccountInfo {
             account_id,
