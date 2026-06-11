@@ -66,6 +66,22 @@ impl IbkrMcpServer {
             client,
         }
     }
+
+    /// Create with shared state managers so caches persist across sessions.
+    pub fn new_shared(
+        client: Arc<IbkrClient>,
+        market_data: Arc<MarketDataManager>,
+        account: Arc<AccountManager>,
+        orders: Arc<OrderManager>,
+    ) -> Self {
+        Self {
+            tool_router: Self::tool_router(),
+            market_data,
+            account,
+            orders,
+            client,
+        }
+    }
 }
 
 impl Default for IbkrMcpServer {

@@ -13,6 +13,9 @@ use rmcp::{
 };
 
 use crate::config::McpConfig;
+use crate::ibkr::account::AccountManager;
+use crate::ibkr::market_data::MarketDataManager;
+use crate::ibkr::orders::OrderManager;
 use crate::mcp::tools::IbkrMcpServer;
 
 use rmcp::ServiceExt;
@@ -65,11 +68,25 @@ pub async fn start_http_on_with_config(
 ) -> anyhow::Result<()> {
     info!(addr = ?listener.local_addr()?, "Starting MCP HTTP server");
 
+    // Create shared state managers once — they hold caches that must
+    // survive across session boundaries (IBKR rate-limit [322] protection).
     let client_for_factory = Arc::clone(&client);
+    let market_data = Arc::new(MarketDataManager::new(
+        Arc::clone(&client),
+        crate::config::Config::default().market_data,
+    ));
+    let account = Arc::new(AccountManager::new(Arc::clone(&client)));
+    let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
+
     let service: StreamableHttpService<IbkrMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
-                Ok(IbkrMcpServer::new(Arc::clone(&client_for_factory)))
+                Ok(IbkrMcpServer::new_shared(
+                    Arc::clone(&client_for_factory),
+                    Arc::clone(&market_data),
+                    Arc::clone(&account),
+                    Arc::clone(&orders),
+                ))
             },
             Default::default(),
             http_config,
