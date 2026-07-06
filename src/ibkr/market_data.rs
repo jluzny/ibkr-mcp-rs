@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use ibapi::prelude::*;
+use ibapi::contracts::OptionComputation;
 use ibapi::contracts::tick_types::TickType;
+use ibapi::market_data::realtime::generic_tick;
 use ibapi::market_data::MarketDataType;
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use futures::StreamExt;
@@ -34,6 +36,14 @@ pub struct CachedQuote {
     pub close: f64,
     pub timestamp: Instant,
     pub source: QuoteSource,
+    /// Option greeks and model fields (populated only for option contracts).
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub theta: Option<f64>,
+    pub vega: Option<f64>,
+    pub rho: Option<f64>,
+    pub implied_volatility: Option<f64>,
+    pub underlying_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,6 +168,13 @@ impl MarketDataManager {
             close: 0.0,
             timestamp: Instant::now(),
             source: market_data_type_to_source(md_type),
+            delta: None,
+            gamma: None,
+            theta: None,
+            vega: None,
+            rho: None,
+            implied_volatility: None,
+            underlying_price: None,
         };
 
         let mut got_data = false;
@@ -340,7 +357,7 @@ impl MarketDataManager {
 
         info!(symbol = %symbol, "Fetching option chain via sec_def_opt_params");
 
-        let mut subscription = client
+        let subscription = client
             .option_chain(symbol, "SMART", SecurityType::Stock, 0)
             .await
             .map_err(|e| IbkrError::Unknown(format!("option_chain request failed: {e}")))?;
@@ -453,6 +470,7 @@ impl MarketDataManager {
 
         let mut subscription = client
             .market_data(contract)
+            .add_generic_tick(generic_tick::OPTION_IMPLIED_VOLATILITY)
             .snapshot()
             .subscribe()
             .await
@@ -469,6 +487,13 @@ impl MarketDataManager {
             close: 0.0,
             timestamp: Instant::now(),
             source: market_data_type_to_source(md_type),
+            delta: None,
+            gamma: None,
+            theta: None,
+            vega: None,
+            rho: None,
+            implied_volatility: None,
+            underlying_price: None,
         };
 
         let mut got_data = false;
@@ -509,6 +534,15 @@ impl MarketDataManager {
                         | TickType::DelayedBidSize | TickType::DelayedAskSize
                         | TickType::DelayedLastSize => { quote.volume += ps.size as i64; }
                         _ => {}
+                    }
+                }
+                Ok(SubscriptionItem::Data(TickTypes::OptionComputation(c))) => {
+                    apply_option_computation(&mut quote, &c);
+                    // If we got model greeks, treat that as useful data even if no price ticks arrived yet.
+                    if matches!(c.field, TickType::ModelOption | TickType::DelayedModelOption)
+                        && c.delta.is_some()
+                    {
+                        got_data = true;
                     }
                 }
                 Ok(SubscriptionItem::Data(TickTypes::SnapshotEnd)) => {
@@ -569,6 +603,44 @@ fn market_data_type_to_source(md_type: MarketDataType) -> QuoteSource {
         MarketDataType::DelayedFrozen => QuoteSource::DelayedFrozen,
         _ => QuoteSource::RealTime,
     }
+}
+
+/// Merge an IBKR option computation tick into a cached quote.
+///
+/// TWS sends multiple option computation ticks (bid/ask/last/model).  We
+/// prefer model-based greeks (field == ModelOption / DelayedModelOption) and
+/// only fill in missing values from the other computation types.  Note that
+/// rust-ibapi's OptionComputation does not include rho, so rho remains None.
+fn apply_option_computation(quote: &mut CachedQuote, computation: &OptionComputation) {
+    let is_model = matches!(
+        computation.field,
+        TickType::ModelOption | TickType::DelayedModelOption
+    );
+
+    let merge = |current: &mut Option<f64>, incoming: Option<f64>, force: bool| {
+        if let Some(value) = incoming {
+            if current.is_none() || force {
+                *current = Some(value);
+            }
+        }
+    };
+
+    merge(&mut quote.delta, computation.delta, is_model);
+    merge(&mut quote.gamma, computation.gamma, is_model);
+    merge(&mut quote.theta, computation.theta, is_model);
+    merge(&mut quote.vega, computation.vega, is_model);
+    merge(&mut quote.implied_volatility, computation.implied_volatility, is_model);
+    merge(&mut quote.underlying_price, computation.underlying_price, is_model);
+
+    tracing::debug!(
+        field = ?computation.field,
+        delta = ?computation.delta,
+        gamma = ?computation.gamma,
+        theta = ?computation.theta,
+        vega = ?computation.vega,
+        iv = ?computation.implied_volatility,
+        "Option computation tick"
+    );
 }
 
 /// Historical bar data

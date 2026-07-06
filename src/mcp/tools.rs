@@ -140,6 +140,12 @@ impl IbkrMcpServer {
                                 QuoteSource::Cache => "cache".to_string(),
                             },
                             timestamp: chrono::Utc::now().to_rfc3339(),
+                            delta: quote.delta,
+                            gamma: quote.gamma,
+                            theta: quote.theta,
+                            vega: quote.vega,
+                            rho: quote.rho,
+                            implied_volatility: quote.implied_volatility,
                             error: None,
                         };
                         serde_json::to_string_pretty(&result)
@@ -225,6 +231,12 @@ impl IbkrMcpServer {
                         QuoteSource::Cache => "cache",
                     },
                     "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "delta": quote.delta,
+                    "gamma": quote.gamma,
+                    "theta": quote.theta,
+                    "vega": quote.vega,
+                    "rho": quote.rho,
+                    "implied_volatility": quote.implied_volatility,
                 }),
                 Err(e) => serde_json::json!({
                     "success": false,
@@ -414,7 +426,7 @@ impl IbkrMcpServer {
     }
 
     /// Get quote for an option contract
-    #[tool(description = "Get a market data quote for a specific option contract. Specify underlying symbol, strike, expiration (YYYYMMDD), and right (C or P).")]
+    #[tool(description = "Get a market data quote for a specific option contract. Specify underlying symbol, strike, expiration (YYYYMMDD), and right (C or P). Returns bid/ask/last price plus greeks (delta, gamma, theta, vega, rho) and implied volatility where available.")]
     async fn get_option_quote(
         &self,
         Parameters(params): Parameters<GetOptionQuoteParams>,
@@ -480,6 +492,13 @@ impl IbkrMcpServer {
                         QuoteSource::Cache => "cache",
                     },
                     "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "delta": quote.delta,
+                    "gamma": quote.gamma,
+                    "theta": quote.theta,
+                    "vega": quote.vega,
+                    "rho": quote.rho,
+                    "implied_volatility": quote.implied_volatility,
+                    "underlying_price": quote.underlying_price,
                 });
                 serde_json::to_string_pretty(&result).unwrap_or_default()
             }
@@ -688,6 +707,12 @@ pub struct QuoteResult {
     pub close: f64,
     pub source: String,
     pub timestamp: String,
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub theta: Option<f64>,
+    pub vega: Option<f64>,
+    pub rho: Option<f64>,
+    pub implied_volatility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
