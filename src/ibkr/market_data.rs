@@ -6,7 +6,6 @@ use tracing::{info, warn};
 use ibapi::prelude::*;
 use ibapi::contracts::OptionComputation;
 use ibapi::contracts::tick_types::TickType;
-use ibapi::market_data::realtime::generic_tick;
 use ibapi::market_data::MarketDataType;
 use ibapi::subscriptions::SubscriptionItemStreamExt;
 use futures::StreamExt;
@@ -468,9 +467,12 @@ impl MarketDataManager {
             }
         }
 
+        // NOTE: Do NOT add generic_tick::OPTION_IMPLIED_VOLATILITY here.
+        // IBKR error 321: "Snapshot market data subscription is not applicable
+        // to generic ticks." Option computation ticks (model greeks) arrive
+        // automatically for option contracts in snapshot mode.
         let mut subscription = client
             .market_data(contract)
-            .add_generic_tick(generic_tick::OPTION_IMPLIED_VOLATILITY)
             .snapshot()
             .subscribe()
             .await
