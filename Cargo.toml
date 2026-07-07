@@ -9,7 +9,7 @@ license = "MIT"
 
 [dependencies]
 ibapi = { git = "https://github.com/wboayue/rust-ibapi", branch = "main" }
-rmcp = { version = "1.6", features = [
+rmcp = { version = "2.1", features = [
     "server",
     "macros",
     "transport-streamable-http-server",
@@ -29,7 +29,7 @@ dashmap = "6.1"
 thiserror = "2"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-schemars = { version = "1.0", features = ["chrono04"] }
+schemars = { version = "1.2", features = ["chrono04"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
