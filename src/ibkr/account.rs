@@ -1,13 +1,14 @@
 use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
 use ibapi::accounts::types::AccountGroup;
 use ibapi::contracts::SecurityType;
-use ibapi::orders::{CommissionReport, ExecutionData, ExecutionFilter, Executions};
-use ibapi::subscriptions::SubscriptionItemStreamExt;
+use ibapi::orders::{ExecutionFilter, Executions};
+use ibapi::subscriptions::{SubscriptionItem, SubscriptionItemStreamExt};
 use futures::StreamExt;
 use tokio::time::{timeout, Duration};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::info;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{info, warn};
 
 use crate::ibkr::client::IbkrClient;
 use crate::ibkr::error::IbkrError;
@@ -63,29 +64,51 @@ pub struct Execution {
     pub multiplier: Option<String>,
 }
 
+/// Shared cache state — held via `Arc` so the background subscription pump
+/// task (which must be `'static`) can update it.
+#[derive(Debug)]
+struct SummaryState {
+    cache: std::sync::Mutex<Option<(AccountInfo, Instant)>>,
+    /// True while the background pump task is running. CAS-guarded so only
+    /// one pump (and therefore ONE account-summary subscription) exists per
+    /// process — this is what makes the 3-concurrent-request cap unreachable.
+    pump_running: AtomicBool,
+}
+
 /// Account manager
 #[derive(Debug)]
 pub struct AccountManager {
     client: Arc<IbkrClient>,
-    /// Cached account summary to avoid rate-limiting IBKR.
-    /// account_summary() is a streaming subscription; opening one per
-    /// cron tick (every 10 min) exhausts the ~3/hour request cap.
-    cache: std::sync::Mutex<Option<(AccountInfo, Instant)>>,
-    /// Cache TTL — stale after this duration triggers a fresh fetch.
+    state: Arc<SummaryState>,
+    /// Cache TTL — data younger than this is served without question.
     cache_ttl: Duration,
+    /// Data older than `stale_max` is NOT served (margin monitor must not
+    /// act on ancient numbers); between TTL and stale_max it is served while
+    /// the pump refreshes in the background.
+    stale_max: Duration,
+    /// Serializes cache-miss fetches so N concurrent callers spawn at most
+    /// one pump.
+    fetch_lock: tokio::sync::Mutex<()>,
 }
 
 impl AccountManager {
     pub fn new(client: Arc<IbkrClient>) -> Self {
         Self {
             client,
-            cache: std::sync::Mutex::new(None),
-            // account_summary() is a streaming subscription with a hard cap of
-            // ~3 concurrent requests per client ID. A short TTL (60s) causes
-            // rate-limit [322] under any moderate load. 5 min is safe for
-            // account snapshots; positions/quotes have separate endpoints.
+            state: Arc::new(SummaryState {
+                cache: std::sync::Mutex::new(None),
+                pump_running: AtomicBool::new(false),
+            }),
             cache_ttl: Duration::from_secs(300),
+            stale_max: Duration::from_secs(900),
+            fetch_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Snapshot of cached data with its age, if any.
+    fn cached(&self) -> Option<(AccountInfo, std::time::Duration)> {
+        let guard = self.state.cache.lock().unwrap();
+        guard.as_ref().map(|(info, ts)| (info.clone(), ts.elapsed()))
     }
 
     /// Get list of managed accounts
@@ -100,154 +123,196 @@ impl AccountManager {
         ))
     }
 
-    /// Get account information — cached to avoid IBKR rate-limit [322].
-    /// account_summary() is a streaming subscription with a ~3/hour request
-    /// cap per client ID. The cache serves data ≤60s old; stale cache
-    /// triggers a background refresh but returns the stale value so the
-    /// caller never waits on the rate-limit window.
+    /// Get account information — one streaming subscription per process.
+    ///
+    /// `account_summary()` is a STREAMING subscription: IBKR pushes updates as
+    /// account values change, and caps CONCURRENT subscriptions at 3 per client.
+    /// The old pattern (open → collect until `End` → cancel) leaked a gateway
+    /// slot per call because ibapi's `cancel()` is a no-op once the `End`
+    /// sentinel has been consumed (`snapshot_ended` flag) — after 3 fetches per
+    /// gateway connection every subsequent call hit
+    /// `[322] Maximum number of account summary requests exceeded`.
+    ///
+    /// This implementation opens ONE subscription per process lifetime and
+    /// pumps it in the background (`spawn_summary_pump`), folding streamed
+    /// updates into the cache. Callers read the cache; on first call they wait
+    /// (bounded by 10s) for the initial snapshot. Data older than `stale_max`
+    /// (15 min) is refused — a margin monitor must not act on ancient numbers.
     pub async fn get_account_info(
         &self,
         account_id: Option<&str>,
     ) -> Result<AccountInfo, IbkrError> {
-        let target_account = account_id.map(|s| s.to_string());
+        let _ = account_id; // single-account deployment; subscription covers "All"
 
-        // 1. Check cache (synchronous — avoids async lock contention)
-        {
-            let guard = self.cache.lock().unwrap();
-            if let Some((cached, ts)) = guard.as_ref() {
-                if ts.elapsed() < self.cache_ttl {
-                    info!(
-                        account_id = account_id.unwrap_or("default"),
-                        "Serving cached account info (age={}s)",
-                        ts.elapsed().as_secs()
-                    );
-                    return Ok(cached.clone());
-                }
-            }
-        } // lock dropped here
-
-        info!(
-            account_id = account_id.unwrap_or("default"),
-            "Fetching fresh account info"
-        );
-
-        // 2. Fetch fresh data
-        let client = self.client.get_client().await?;
-
-        let tags = &[
-            AccountSummaryTags::NET_LIQUIDATION,
-            AccountSummaryTags::AVAILABLE_FUNDS,
-            AccountSummaryTags::EXCESS_LIQUIDITY,
-            AccountSummaryTags::BUYING_POWER,
-            AccountSummaryTags::TOTAL_CASH_VALUE,
-            AccountSummaryTags::GROSS_POSITION_VALUE,
-            AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
-        ];
-
-        let subscription = timeout(
-            Duration::from_secs(10),
-            client.account_summary(&AccountGroup("All".to_string()), tags)
-        )
-        .await
-        .map_err(|e| {
-            // On timeout, try to serve stale cache
-            let guard = self.cache.lock().unwrap();
-            if let Some((cached, _)) = guard.as_ref() {
-                return IbkrError::Unknown(
-                    format!("Timeout; serving stale cache: {e}")
+        // 1. Fresh cache → serve immediately
+        if let Some((cached, age)) = self.cached() {
+            if age < self.cache_ttl {
+                info!(
+                    account_id = %cached.account_id,
+                    "Serving cached account info (age={}s)", age.as_secs()
                 );
-            }
-            IbkrError::Unknown(format!("account_summary timeout: {e}"))
-        })?
-        .map_err(|e| {
-            let err_msg = format!("account_summary failed: {e}");
-            if err_msg.contains("Maximum number of account summary requests exceeded") {
-                let guard = self.cache.lock().unwrap();
-                if let Some((cached, _)) = guard.as_ref() {
-                    return IbkrError::Unknown(
-                        format!("Rate-limited; serving stale cache: {err_msg}")
-                    );
-                }
-            }
-            IbkrError::Unknown(err_msg)
-        })?;
-
-        let mut values: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
-
-        let mut account_id: Option<String> = None;
-
-        let mut data_stream = subscription.clone().filter_data();
-        let collect_timeout = Duration::from_secs(5);
-        let start = std::time::Instant::now();
-
-        while start.elapsed() < collect_timeout {
-            match timeout(Duration::from_millis(500), data_stream.next()).await {
-                Ok(Some(Ok(AccountSummaryResult::Summary(summary)))) => {
-                    if account_id.is_none() {
-                        account_id = Some(summary.account.clone());
-                    }
-                    if target_account.is_none()
-                        || target_account.as_ref() == Some(&summary.account)
-                    {
-                        values.insert(
-                            summary.tag.clone(),
-                            (summary.value.clone(), summary.currency.clone()),
-                        );
-                    }
-                }
-                Ok(Some(Ok(AccountSummaryResult::End))) => break,
-                Ok(Some(Err(e))) => {
-                    subscription.cancel().await;
-                    return Err(IbkrError::Unknown(format!(
-                        "account_summary stream error: {e}"
-                    )));
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    if !values.is_empty() {
-                        break;
-                    }
-                }
+                return Ok(cached);
             }
         }
 
-        subscription.cancel().await;
+        // 2. Stale or empty → make sure the pump is running, wait for refresh.
+        //    fetch_lock collapses N concurrent callers into one pump spawn.
+        let _permit = self.fetch_lock.lock().await;
 
-        if values.is_empty() {
-            // Fall back to stale cache on empty result
-            let guard = self.cache.lock().unwrap();
-            if let Some((cached, _)) = guard.as_ref() {
-                return Ok(cached.clone());
+        // Re-check after acquiring the lock — the lock holder may have refreshed
+        if let Some((cached, age)) = self.cached() {
+            if age < self.cache_ttl {
+                info!(
+                    account_id = %cached.account_id,
+                    "Serving cached account info (age={}s)", age.as_secs()
+                );
+                return Ok(cached);
             }
-            return Err(IbkrError::Unknown(
-                "No account summary data received".to_string(),
-            ));
         }
 
-        let get = |tag: &str| values.get(tag).map(|(v, _)| v.clone()).unwrap_or_default();
+        self.spawn_summary_pump();
 
-        let account_id = account_id.unwrap_or_default();
+        // 3. Wait for the pump to land the initial snapshot (bounded 10s)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some((cached, age)) = self.cached() {
+                info!(
+                    account_id = %cached.account_id,
+                    "Snapshot received after wait (age={}s)", age.as_secs()
+                );
+                return Ok(cached);
+            }
+        }
 
-        let info = AccountInfo {
-            account_id,
-            net_liquidation: parse_f64(&get(AccountSummaryTags::NET_LIQUIDATION)),
-            available_funds: parse_f64(&get(AccountSummaryTags::AVAILABLE_FUNDS)),
-            excess_liquidity: parse_f64(&get(AccountSummaryTags::EXCESS_LIQUIDITY)),
-            buying_power: parse_f64(&get(AccountSummaryTags::BUYING_POWER)),
-            currency: "USD".to_string(),
-            daily_pnl: 0.0,
-            unrealized_pnl: 0.0,
-            realized_pnl: 0.0,
-        };
+        // 4. Timed out. Serve stale data if within stale_max, else error.
+        if let Some((cached, age)) = self.cached() {
+            if age < self.stale_max {
+                warn!(
+                    age_secs = age.as_secs(),
+                    "Snapshot wait timed out; serving stale account info"
+                );
+                return Ok(cached);
+            }
+        }
+        warn!("Timeout waiting for account summary snapshot");
+        Err(IbkrError::Unknown(
+            "account summary snapshot not received within 10s — gateway may be starting up".to_string(),
+        ))
+    }
 
-        // 3. Update cache
+    /// Ensure exactly one background subscription pump is running.
+    ///
+    /// The pump opens the account-summary subscription ONCE and keeps it open
+    /// for the process lifetime, folding streamed updates into the cache. If
+    /// the stream errors/ends, the pump clears `pump_running` and exits; the
+    /// next `get_account_info` call observes stale/empty cache and re-spawns
+    /// it (a new open is then legitimate — the old subscription is gone).
+    fn spawn_summary_pump(&self) {
+        // CAS: only one caller transitions false → true and spawns the pump
+        if self
+            .state
+            .pump_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
-            let mut guard = self.cache.lock().unwrap();
-            *guard = Some((info.clone(), Instant::now()));
+            return; // pump already running
         }
 
-        Ok(info)
+        let client = Arc::clone(&self.client);
+        let state = Arc::clone(&self.state);
+
+        tokio::spawn(async move {
+            let mut backoff_secs: u64 = 2;
+            loop {
+                let arc_client = match client.get_client().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Pump: not connected ({e}), retrying");
+                        sleep_with_backoff(&mut backoff_secs).await;
+                        continue;
+                    }
+                };
+
+                let tags: Vec<&str> = vec![
+                    AccountSummaryTags::NET_LIQUIDATION,
+                    AccountSummaryTags::AVAILABLE_FUNDS,
+                    AccountSummaryTags::EXCESS_LIQUIDITY,
+                    AccountSummaryTags::BUYING_POWER,
+                    AccountSummaryTags::TOTAL_CASH_VALUE,
+                    AccountSummaryTags::GROSS_POSITION_VALUE,
+                    AccountSummaryTags::EQUITY_WITH_LOAN_VALUE,
+                ];
+
+                info!("Pump: opening account summary subscription");
+                let subscription = match arc_client
+                    .account_summary(&AccountGroup("All".to_string()), &tags)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("Maximum number of account summary requests exceeded") {
+                            // Another consumer holds the slots — do NOT hammer.
+                            warn!("Pump: [322] opening summary — backing off 5 min");
+                            tokio::time::sleep(Duration::from_secs(300)).await;
+                        } else {
+                            warn!("Pump: account_summary failed: {msg}");
+                            sleep_with_backoff(&mut backoff_secs).await;
+                        }
+                        continue;
+                    }
+                };
+
+                info!("Pump: subscription open, streaming updates into cache");
+                // Use the raw subscription stream (not filter_data) so Notices
+                // — including IBKR error notices like [322] — are observable.
+                let mut stream = subscription;
+                // Accumulator: tag → (value, currency). Persisted to cache on
+                // every End / update batch.
+                let mut values: std::collections::HashMap<String, (String, String)> =
+                    std::collections::HashMap::new();
+                let mut acct: Option<String> = None;
+
+                loop {
+                    match stream.next().await {
+                        Some(Ok(SubscriptionItem::Data(AccountSummaryResult::Summary(s)))) => {
+                            if acct.is_none() {
+                                acct = Some(s.account.clone());
+                            }
+                            values.insert(s.tag.clone(), (s.value.clone(), s.currency.clone()));
+                        }
+                        // End marks the end of the *initial snapshot*; the
+                        // subscription stays open and continues streaming.
+                        Some(Ok(SubscriptionItem::Data(AccountSummaryResult::End))) => {
+                            if !values.is_empty() {
+                                let info = build_account_info(&values, acct.as_deref());
+                                *state.cache.lock().unwrap() = Some((info, Instant::now()));
+                                info!(account_id = acct.as_deref().unwrap_or("?"),
+                                      "Pump: snapshot complete, cache updated");
+                            }
+                            backoff_secs = 2; // reset on success
+                        }
+                        Some(Ok(SubscriptionItem::Notice(n))) => {
+                            warn!("Pump: notice from IBKR: {n}");
+                        }
+                        Some(Err(e)) => {
+                            warn!("Pump: stream error ({e}) — will reopen");
+                            break;
+                        }
+                        None => {
+                            warn!("Pump: stream ended — will reopen");
+                            break;
+                        }
+                    }
+                }
+
+                // Stream died: brief pause, then reopen (IBKR sends updates
+                // periodically; the cap applies to CONCURRENT opens, and the
+                // old one is gone).
+                sleep_with_backoff(&mut backoff_secs).await;
+            }
+        });
     }
 
     /// Get current positions
@@ -457,6 +522,36 @@ impl AccountManager {
 
 fn parse_f64(s: &str) -> f64 {
     s.parse().unwrap_or(0.0)
+}
+
+/// Build an `AccountInfo` from accumulated summary values.
+fn build_account_info(
+    values: &std::collections::HashMap<String, (String, String)>,
+    account_id: Option<&str>,
+) -> AccountInfo {
+    let get = |tag: &str| {
+        values
+            .get(tag)
+            .map(|(v, _)| v.clone())
+            .unwrap_or_default()
+    };
+    AccountInfo {
+        account_id: account_id.unwrap_or_default().to_string(),
+        net_liquidation: parse_f64(&get(AccountSummaryTags::NET_LIQUIDATION)),
+        available_funds: parse_f64(&get(AccountSummaryTags::AVAILABLE_FUNDS)),
+        excess_liquidity: parse_f64(&get(AccountSummaryTags::EXCESS_LIQUIDITY)),
+        buying_power: parse_f64(&get(AccountSummaryTags::BUYING_POWER)),
+        currency: "USD".to_string(),
+        daily_pnl: 0.0,
+        unrealized_pnl: 0.0,
+        realized_pnl: 0.0,
+    }
+}
+
+/// Exponential backoff sleep for the pump loop, capped at 60s.
+async fn sleep_with_backoff(backoff_secs: &mut u64) {
+    tokio::time::sleep(Duration::from_secs(*backoff_secs)).await;
+    *backoff_secs = (*backoff_secs * 2).min(60);
 }
 
 #[cfg(test)]
