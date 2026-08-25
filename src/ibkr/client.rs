@@ -126,24 +126,81 @@ impl IbkrClient {
 
     /// Polls connection health. Returns when connection is lost.
     ///
-    /// To prevent IBKR rate-limiting (error 322), we exit the process
-    /// instead of auto-reconnecting with the same client_id. Docker
-    /// autoheal restarts the container with a clean subscription slate.
+    /// Two checks are needed because ibapi's `is_connected()` only tracks the
+    /// TCP socket state (an atomic bool set at handshake time). When socat is
+    /// in front of the IB Gateway, the TCP socket stays open even when the
+    /// IBKR API session goes stale (daily re-authentication, 2FA expiry, etc.),
+    /// so `is_connected()` returns `true` while the actual IBKR session is dead.
+    ///
+    /// To catch stale sessions, we periodically attempt a lightweight IBKR
+    /// request. If it fails, we exit the process so systemd `Restart=always`
+    /// brings up a fresh connection with a clean subscription slate.
     async fn maintain_connection(&self) {
+        let mut consecutive_failures: u32 = 0;
         loop {
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(30)).await;
 
-            let guard = self.inner.read().await;
-            let connected = guard
-                .as_ref()
-                .map(|c| c.is_connected())
-                .unwrap_or(false);
-            drop(guard);
+            // Fast path: ibapi says disconnected (TCP dead)
+            {
+                let guard = self.inner.read().await;
+                let connected = guard
+                    .as_ref()
+                    .map(|c| c.is_connected())
+                    .unwrap_or(false);
+                drop(guard);
 
-            if !connected {
-                warn!("Connection lost — exiting to let Docker restart with fresh subscriptions");
-                std::process::exit(1);
+                if !connected {
+                    warn!("Connection lost (TCP) — exiting for systemd restart");
+                    std::process::exit(1);
+                }
             }
+
+            // Deep path: TCP is alive but the IBKR session may be stale.
+            // Try a lightweight request to probe the actual API health.
+            let probe_ok = match self.probe_connection().await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "Connection probe failed (stale session suspected)");
+                    false
+                }
+            };
+
+            if probe_ok {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                // After 3 consecutive probe failures (~90s), exit for restart.
+                if consecutive_failures >= 3 {
+                    warn!(
+                        failures = consecutive_failures,
+                        "Sustained connection probe failures — exiting for systemd restart"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    /// Lightweight IBKR API probe. Requests managed accounts — a cheap,
+    /// read-only call that doesn't consume subscription slots.
+    async fn probe_connection(&self) -> Result<(), IbkrError> {
+        let client = self.get_client().await?;
+        // Request managed accounts: a minimal call that exercises the
+        // full IBKR message bus without opening a subscription.
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            client.managed_accounts(),
+        ).await {
+            Ok(Ok(accounts)) => {
+                if accounts.is_empty() {
+                    return Err(IbkrError::Unknown(
+                        "probe returned empty account list".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(IbkrError::Unknown(format!("probe error: {e}"))),
+            Err(_) => Err(IbkrError::Unknown("probe timeout".to_string())),
         }
     }
 

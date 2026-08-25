@@ -302,6 +302,7 @@ impl IbkrMcpServer {
                             "symbol": p.symbol,
                             "quantity": p.quantity,
                             "averageCost": p.average_cost,
+                            "contractId": p.contract_id,
                             "marketPrice": p.market_price,
                             "marketValue": p.market_value,
                             "unrealizedPnL": p.unrealized_pnl,

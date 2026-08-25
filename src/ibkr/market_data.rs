@@ -347,7 +347,14 @@ impl MarketDataManager {
         results
     }
 
-    /// Get option chain for a symbol
+    /// Get option chain for a symbol.
+    ///
+    /// Resolves the real underlying contract ID via `contract_details()` first,
+    /// then calls `option_chain` with `exchange=""` (all exchanges) and the
+    /// real conID. This fixes error [321] on symbols like INIO/XYZ where
+    /// `con_id=0` + `exchange="SMART"` fails because TWS cannot auto-resolve
+    /// certain tickers by symbol alone, and SMART is not a valid exchange for
+    /// sec_def_opt_params (it's a routing directive).
     pub async fn get_option_chain(
         &self,
         symbol: &str,
@@ -356,8 +363,13 @@ impl MarketDataManager {
 
         info!(symbol = %symbol, "Fetching option chain via sec_def_opt_params");
 
+        // Step 1: Resolve the real underlying contract ID
+        let con_id = self.resolve_contract_id(&client, symbol).await?;
+        info!(symbol = %symbol, con_id, "Resolved underlying contract ID");
+
+        // Step 2: Call option_chain with exchange="" (all exchanges) and real conID
         let subscription = client
-            .option_chain(symbol, "SMART", SecurityType::Stock, 0)
+            .option_chain(symbol, "", SecurityType::Stock, con_id)
             .await
             .map_err(|e| IbkrError::Unknown(format!("option_chain request failed: {e}")))?;
 
@@ -392,6 +404,34 @@ impl MarketDataManager {
                 "No option chain data received for {symbol}"
             ))),
         }
+    }
+
+    /// Resolve the real IBKR contract ID for a stock symbol.
+    ///
+    /// Uses `contract_details()` with a stock contract to get the real conID.
+    /// This is needed because `option_chain` with `con_id=0` fails for some
+    /// symbols (error 321) — TWS cannot auto-resolve certain tickers.
+    /// Proven fix from the Go project (options-trading-agent-go).
+    async fn resolve_contract_id(
+        &self,
+        client: &Arc<ibapi::Client>,
+        symbol: &str,
+    ) -> Result<i32, IbkrError> {
+        let contract = Contract::stock(symbol).build();
+
+        let details = client
+            .contract_details(&contract)
+            .await
+            .map_err(|e| IbkrError::Unknown(format!("contract_details failed for {symbol}: {e}")))?;
+
+        if details.is_empty() {
+            return Err(IbkrError::Unknown(format!(
+                "No contract details returned for {symbol} — symbol may not exist or may not have options"
+            )));
+        }
+
+        let con_id = details[0].contract.contract_id;
+        Ok(con_id)
     }
 
     /// Fetch a market data snapshot for an option contract.

@@ -9,6 +9,7 @@ fn position_json_includes_option_fields() {
         symbol: "BTDR".into(),
         quantity: -2.0,
         average_cost: 476.30,
+        contract_id: 0,
         market_price: 0.0,
         market_value: 0.0,
         unrealized_pnl: 0.0,
@@ -24,6 +25,7 @@ fn position_json_includes_option_fields() {
         "symbol": pos.symbol,
         "quantity": pos.quantity,
         "averageCost": pos.average_cost,
+        "contractId": pos.contract_id,
         "marketPrice": pos.market_price,
         "marketValue": pos.market_value,
         "unrealizedPnL": pos.unrealized_pnl,
@@ -49,6 +51,7 @@ fn position_json_stock_has_null_option_fields() {
         symbol: "SOFI".into(),
         quantity: 700.0,
         average_cost: 25.21,
+        contract_id: 0,
         market_price: 15.61,
         market_value: 10927.0,
         unrealized_pnl: -6720.0,
@@ -64,6 +67,7 @@ fn position_json_stock_has_null_option_fields() {
         "symbol": pos.symbol,
         "quantity": pos.quantity,
         "averageCost": pos.average_cost,
+        "contractId": pos.contract_id,
         "marketPrice": pos.market_price,
         "marketValue": pos.market_value,
         "unrealizedPnL": pos.unrealized_pnl,
@@ -89,6 +93,7 @@ fn position_json_put_option_round_trip() {
         symbol: "XXI".into(),
         quantity: -1.0,
         average_cost: 848.75,
+        contract_id: 0,
         market_price: 0.0,
         market_value: 0.0,
         unrealized_pnl: 0.0,
@@ -120,4 +125,42 @@ fn position_json_put_option_round_trip() {
     assert_eq!(json["right"], "P");
     assert_eq!(json["expiration"], "20260717");
     assert_eq!(json["multiplier"], "100");
+}
+
+#[test]
+fn position_json_includes_contract_id() {
+    let pos = Position {
+        account_id: "U18197748".into(),
+        symbol: "AAPL".into(),
+        quantity: 100.0,
+        average_cost: 150.25,
+        contract_id: 265598,
+        market_price: 175.50,
+        market_value: 17550.0,
+        unrealized_pnl: 2525.0,
+        daily_pnl: 100.0,
+        security_type: "STK".into(),
+        strike: None,
+        right: None,
+        expiration: None,
+        multiplier: None,
+    };
+
+    let json = serde_json::json!({
+        "symbol": pos.symbol,
+        "quantity": pos.quantity,
+        "averageCost": pos.average_cost,
+        "contractId": pos.contract_id,
+        "marketPrice": pos.market_price,
+        "marketValue": pos.market_value,
+        "unrealizedPnL": pos.unrealized_pnl,
+        "dailyPnL": pos.daily_pnl,
+        "securityType": pos.security_type,
+    });
+
+    assert_eq!(json["contractId"], 265598);
+    assert_eq!(json["marketPrice"], 175.50);
+    assert_eq!(json["marketValue"], 17550.0);
+    assert_eq!(json["unrealizedPnL"], 2525.0);
+    assert_eq!(json["dailyPnL"], 100.0);
 }

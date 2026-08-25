@@ -1,5 +1,5 @@
 use ibapi::accounts::{AccountSummaryResult, AccountSummaryTags, PositionUpdate};
-use ibapi::accounts::types::AccountGroup;
+use ibapi::accounts::types::{AccountGroup, AccountId, ContractId};
 use ibapi::contracts::SecurityType;
 use ibapi::orders::{ExecutionFilter, Executions};
 use ibapi::subscriptions::{SubscriptionItem, SubscriptionItemStreamExt};
@@ -34,6 +34,7 @@ pub struct Position {
     pub symbol: String,
     pub quantity: f64,
     pub average_cost: f64,
+    pub contract_id: i32,
     pub market_price: f64,
     pub market_value: f64,
     pub unrealized_pnl: f64,
@@ -172,30 +173,46 @@ impl AccountManager {
 
         self.spawn_summary_pump();
 
-        // 3. Wait for the pump to land the initial snapshot (bounded 10s)
+        // 3. Wait for the pump to land a FRESH snapshot (bounded 10s).
+        //    Only return when age < cache_ttl — stale cache must NOT be
+        //    returned from this step (that was BUG 2).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(200)).await;
             if let Some((cached, age)) = self.cached() {
-                info!(
-                    account_id = %cached.account_id,
-                    "Snapshot received after wait (age={}s)", age.as_secs()
-                );
-                return Ok(cached);
+                if age < self.cache_ttl {
+                    info!(
+                        account_id = %cached.account_id,
+                        "Fresh snapshot received after wait (age={}s)", age.as_secs()
+                    );
+                    return Ok(cached);
+                }
+                // Cache exists but is stale — keep waiting for the pump to refresh.
             }
         }
 
-        // 4. Timed out. Serve stale data if within stale_max, else error.
+        // 4. Timed out waiting for fresh data. Serve stale if within stale_max,
+        //    else refuse so the margin monitor never acts on ancient numbers.
         if let Some((cached, age)) = self.cached() {
             if age < self.stale_max {
                 warn!(
                     age_secs = age.as_secs(),
-                    "Snapshot wait timed out; serving stale account info"
+                    "Wait timed out; serving stale account info (within stale_max)"
                 );
                 return Ok(cached);
+            } else {
+                warn!(
+                    age_secs = age.as_secs(),
+                    stale_max_secs = self.stale_max.as_secs(),
+                    "Refusing stale account info (exceeds stale_max)"
+                );
+                return Err(IbkrError::Unknown(format!(
+                    "account info stale (age={}s, max={}s) — pump may be disconnected or gateway down",
+                    age.as_secs(), self.stale_max.as_secs()
+                )));
             }
         }
-        warn!("Timeout waiting for account summary snapshot");
+        warn!("No cache available and pump didn't deliver within 10s");
         Err(IbkrError::Unknown(
             "account summary snapshot not received within 10s — gateway may be starting up".to_string(),
         ))
@@ -281,6 +298,17 @@ impl AccountManager {
                                 acct = Some(s.account.clone());
                             }
                             values.insert(s.tag.clone(), (s.value.clone(), s.currency.clone()));
+                            // BUG 1 FIX: Also update the cache on every Summary event,
+                            // not just on End. IBKR sends End once (initial snapshot),
+                            // then only streams individual Summary updates. Without
+                            // this, the cache timestamp freezes at the initial End and
+                            // the cache appears stale forever.
+                            // Guard: only write once NLV is present to avoid partial
+                            // snapshots during the initial tag-by-tag stream.
+                            if values.contains_key(AccountSummaryTags::NET_LIQUIDATION) {
+                                let info = build_account_info(&values, acct.as_deref());
+                                *state.cache.lock().unwrap() = Some((info, Instant::now()));
+                            }
                         }
                         // End marks the end of the *initial snapshot*; the
                         // subscription stays open and continues streaming.
@@ -350,6 +378,7 @@ impl AccountManager {
                             symbol: pos.contract.symbol.to_string(),
                             quantity: pos.position,
                             average_cost: pos.average_cost,
+                            contract_id: pos.contract.contract_id,
                             market_price: 0.0,
                             market_value: 0.0,
                             unrealized_pnl: 0.0,
@@ -390,6 +419,64 @@ impl AccountManager {
         // Same race condition as account_summary — Drop's fire-and-forget
         // tokio::spawn may not complete before the next request.
         subscription.cancel().await;
+
+        // --- PnL Enrichment (Option B: pnl_single per position) ---
+        // Proven approach from Go project: options-trading-agent-go.
+        // After collecting positions, call pnl_single for each to populate
+        // market_price, market_value, unrealized_pnl, daily_pnl.
+        if !positions.is_empty() {
+            let account_id = positions[0].account_id.clone();
+            let ibkr_account = AccountId(account_id.clone());
+
+            for pos in &mut positions {
+                let contract_id = ContractId(pos.contract_id);
+
+                match client.pnl_single(&ibkr_account, contract_id, None).await {
+                    Ok(pnl_sub) => {
+                        // filter_data() takes ownership, so clone the subscription
+                        // to retain a handle for cancellation afterwards.
+                        let pnl_clone = pnl_sub.clone();
+                        let pnl_result = timeout(
+                            Duration::from_secs(3),
+                            pnl_sub.filter_data().next(),
+                        ).await;
+
+                        match pnl_result {
+                            Ok(Some(Ok(pnl))) => {
+                                let value = filter_sentinel(pnl.value);
+                                let daily_pnl = filter_sentinel(pnl.daily_pnl);
+                                let unrealized_pnl = filter_sentinel(pnl.unrealized_pnl);
+
+                                // Compute mark price: value / position.
+                                // Options: divide by 100 (standard multiplier).
+                                let mark_price = if pnl.position != 0.0 {
+                                    let raw = value / pnl.position;
+                                    if pos.security_type == "OPT" || pos.security_type == "FOP" {
+                                        raw / 100.0
+                                    } else {
+                                        raw
+                                    }
+                                } else {
+                                    0.0
+                                };
+
+                                pos.market_price = mark_price;
+                                pos.market_value = value;
+                                pos.unrealized_pnl = unrealized_pnl;
+                                pos.daily_pnl = daily_pnl;
+                            }
+                            _ => {
+                                warn!("pnl_single timeout for {}", pos.symbol);
+                            }
+                        }
+                        pnl_clone.cancel().await;
+                    }
+                    Err(e) => {
+                        warn!("pnl_single failed for {}: {e}", pos.symbol);
+                    }
+                }
+            }
+        }
 
         Ok(positions)
     }
@@ -522,6 +609,18 @@ impl AccountManager {
 
 fn parse_f64(s: &str) -> f64 {
     s.parse().unwrap_or(0.0)
+}
+
+/// Filter IBKR sentinel/garbage values (MaxFloat64 ~1.79e11).
+/// Cap at +/-1e11 — anything beyond is garbage data from IBKR.
+/// Also catches NaN and Infinity.
+fn filter_sentinel(v: f64) -> f64 {
+    const MAX_REASONABLE: f64 = 1e11;
+    if v >= MAX_REASONABLE || v <= -MAX_REASONABLE || v.is_nan() || v.is_infinite() {
+        0.0
+    } else {
+        v
+    }
 }
 
 /// Build an `AccountInfo` from accumulated summary values.
