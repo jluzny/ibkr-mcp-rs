@@ -8,6 +8,7 @@ use axum::{
 use serde_json::json;
 
 use crate::ibkr::client::IbkrClient;
+use crate::persistence;
 
 /// Build health check router
 pub fn health_router(client: Arc<IbkrClient>) -> Router {
@@ -15,6 +16,7 @@ pub fn health_router(client: Arc<IbkrClient>) -> Router {
         .route("/health/ready", get(health_ready))
         .route("/health/live", get(health_live))
         .route("/health/broker", get(health_broker))
+        .route("/health/last-good", get(health_last_good))
         .route("/version", get(version))
         .with_state(client)
 }
@@ -44,6 +46,32 @@ async fn health_live() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::OK,
         Json(json!({"alive": true})),
     )
+}
+
+/// Exposes the last-known-good account snapshot regardless of current
+/// connection state. Callers can check `ageSecs` and decide for themselves
+/// whether to act on it — turns "broker unreachable" from a hard 500 into
+/// a data-quality signal (fresh / stale / very-stale).
+async fn health_last_good() -> (StatusCode, Json<serde_json::Value>) {
+    match persistence::get() {
+        Some(state) => (
+            StatusCode::OK,
+            Json(json!({
+                "available": true,
+                "ageSecs": persistence::age_secs(),
+                "fetchedAtUnix": state.fetched_at_unix,
+                "loadedFromDisk": state.loaded_from_disk,
+                "account": state.account,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "available": false,
+                "reason": "no snapshot recorded yet this process and none on disk",
+            })),
+        ),
+    }
 }
 
 async fn health_broker(

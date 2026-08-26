@@ -17,8 +17,12 @@ async fn main() -> anyhow::Result<()> {
 
     info!(stdio = use_stdio, "Starting IBKR MCP Server");
 
+    // Load any persisted last-good snapshot before taking traffic
+    ibkr_mcp_rs::persistence::load_from_disk();
+
     let client = IbkrClient::new(config.ibkr.clone());
     client.clone().connect();
+    client.start_canary();
 
     // Wait for initial connection
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -48,13 +52,26 @@ async fn main() -> anyhow::Result<()> {
             })
         };
 
-        // Wait for shutdown signal
+        // Wait for shutdown signal. `JoinError` on the HTTP task means a
+        // panic inside the spawned server — surface it loudly and exit so
+        // systemd restarts us, instead of pretending the server exited
+        // normally (which it didn't).
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal");
             }
-            _ = server_handle => {
-                info!("MCP server exited");
+            res = server_handle => {
+                match res {
+                    Ok(()) => info!("MCP HTTP server exited"),
+                    Err(e) if e.is_panic() => {
+                        tracing::error!(error = %e, "MCP HTTP server panicked — exiting");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "MCP HTTP server task ended abnormally — exiting");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
 

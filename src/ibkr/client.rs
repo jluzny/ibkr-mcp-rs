@@ -217,6 +217,84 @@ impl IbkrClient {
         }
     }
 
+    /// Start a constant "canary" that probes the broker every 60s regardless
+    /// of connection state. Independent of `maintain_connection()` (which only
+    /// runs while connected and stops during reconnect backoff) — this runs
+    /// forever and exits the process on 5 consecutive failures so systemd
+    /// revives it. This is what would have caught the 2026-08-26 20h silent
+    /// outage at minute ~5 instead of 20 hours.
+    ///
+    /// Also writes a heartbeat file (`IBKR_MCP_HEARTBEAT_PATH`, default
+    /// `/tmp/ibkr-mcp-heartbeat`) on every successful probe. The gateway's
+    /// own watchdog watches this file's mtime: if the MCP goes silent for
+    /// > threshold, the gateway knows the whole pipeline is wedged and
+    /// exits for a systemd restart. One file, both ends self-heal.
+    pub fn start_canary(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            const HEARTBEAT_PATH_ENV: &str = "IBKR_MCP_HEARTBEAT_PATH";
+
+            let mut consecutive_failures: u32 = 0;
+            loop {
+                sleep(Duration::from_secs(60)).await;
+
+                let mut healthy = false;
+                if !this.is_connected().await {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    warn!(
+                        failures = consecutive_failures,
+                        "Canary: not connected"
+                    );
+                } else {
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        this.probe_connection(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            consecutive_failures = 0;
+                            healthy = true;
+                        }
+                        Ok(Err(e)) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                "Canary: probe failed: {}, failures = {}",
+                                e, consecutive_failures
+                            );
+                        }
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            warn!(
+                                failures = consecutive_failures,
+                                "Canary: probe timeout"
+                            );
+                        }
+                    }
+                }
+
+                if healthy {
+                    let path = std::env::var(HEARTBEAT_PATH_ENV)
+                        .unwrap_or_else(|_| "/tmp/ibkr-mcp-heartbeat".to_string());
+                    // Heartbeat for external watchdogs/systemd timers that
+                    // want a cheap signal without touching the API.
+                    if let Ok(mut f) = std::fs::File::create(&path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", chrono::Utc::now().to_rfc3339());
+                    }
+                }
+
+                if consecutive_failures >= 5 {
+                    error!(
+                        failures = consecutive_failures,
+                        "Canary: 5 consecutive failures (~5 min) — exiting for systemd restart"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
     /// Check if connected
     pub async fn is_connected(&self) -> bool {
         let guard = self.inner.read().await;

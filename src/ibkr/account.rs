@@ -12,9 +12,10 @@ use tracing::{info, warn};
 
 use crate::ibkr::client::IbkrClient;
 use crate::ibkr::error::IbkrError;
+use crate::persistence;
 
 /// Account information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountInfo {
     pub account_id: String,
     pub net_liquidation: f64,
@@ -239,7 +240,34 @@ impl AccountManager {
         let client = Arc::clone(&self.client);
         let state = Arc::clone(&self.state);
 
+        let pump_handle = tokio::spawn(Self::pump_loop(client, state));
+
+        // Panic supervisor: if the pump task panics (a panic inside a spawned
+        // task does NOT kill the process — tokio swallows it), exit so systemd
+        // Restart=always revives a clean process instead of a silent zombie.
+        // Same pattern as the reconnect-loop supervisor in client.rs.
         tokio::spawn(async move {
+            match pump_handle.await {
+                Ok(()) => {
+                    // Pump exited cleanly (e.g. stream ended and loop broke out).
+                    // Next get_account_info call will re-spawn it if needed.
+                    warn!("Account summary pump exited cleanly");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        is_panic = e.is_panic(),
+                        error = %e,
+                        "Account summary pump task panicked — exiting for systemd restart"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+
+    /// The streaming pump loop. Extracted to a free-standing method so the
+    /// spawn site stays small and the supervisor stays obvious.
+    async fn pump_loop(client: Arc<IbkrClient>, state: Arc<SummaryState>) {
             let mut backoff_secs: u64 = 2;
             loop {
                 let arc_client = match client.get_client().await {
@@ -307,7 +335,8 @@ impl AccountManager {
                             // snapshots during the initial tag-by-tag stream.
                             if values.contains_key(AccountSummaryTags::NET_LIQUIDATION) {
                                 let info = build_account_info(&values, acct.as_deref());
-                                *state.cache.lock().unwrap() = Some((info, Instant::now()));
+                                *state.cache.lock().unwrap() = Some((info.clone(), Instant::now()));
+                                persistence::record(info);
                             }
                         }
                         // End marks the end of the *initial snapshot*; the
@@ -315,7 +344,8 @@ impl AccountManager {
                         Some(Ok(SubscriptionItem::Data(AccountSummaryResult::End))) => {
                             if !values.is_empty() {
                                 let info = build_account_info(&values, acct.as_deref());
-                                *state.cache.lock().unwrap() = Some((info, Instant::now()));
+                                *state.cache.lock().unwrap() = Some((info.clone(), Instant::now()));
+                                persistence::record(info);
                                 info!(account_id = acct.as_deref().unwrap_or("?"),
                                       "Pump: snapshot complete, cache updated");
                             }
@@ -340,7 +370,6 @@ impl AccountManager {
                 // old one is gone).
                 sleep_with_backoff(&mut backoff_secs).await;
             }
-        });
     }
 
     /// Get current positions
