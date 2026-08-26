@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use ibapi::prelude::*;
 
@@ -40,7 +40,8 @@ impl IbkrClient {
 
     /// Start background reconnection loop
     pub fn connect(self: Arc<Self>) {
-        tokio::spawn(async move {
+        let supervised = Arc::clone(&self);
+        let reconnect_handle = tokio::spawn(async move {
             let mut attempts: u32 = 0;
             let max_delay = Duration::from_secs(60);
             let max_attempts_before_stall = 10;
@@ -101,6 +102,18 @@ impl IbkrClient {
                     }
                 }
             }
+        });
+
+        // Supervise the reconnect task: if it panics (a panic inside a spawned
+        // task does not kill the process), exit so systemd Restart=always brings
+        // up a fresh process. Without this, a dead reconnect loop leaves the MCP
+        // HTTP server serving stale/erroring responses indefinitely.
+        tokio::spawn(async move {
+            if reconnect_handle.await.is_err() {
+                error!("IBKR reconnect loop panicked or ended — exiting for systemd restart");
+                std::process::exit(1);
+            }
+            let _ = supervised; // keep Arc alive for the lifetime of the supervisor
         });
     }
 
@@ -232,8 +245,13 @@ impl IbkrClient {
         if attempts == 0 {
             return Duration::ZERO;
         }
+        // Exponential backoff with overflow-safe exponentiation: cap the exponent
+        // so 1.6^e can never exceed u64 nanoseconds (panics in mul_f64 past ~e=96,
+        // which killed the reconnect loop for 20h on 2026-08-26).
+        const MAX_EXPONENT: u32 = 40; // 1.6^40 ≈ 2.4e8 s, far above any sane ceiling
+        let exp = (attempts as u32).min(MAX_EXPONENT) - 1;
         let base = Duration::from_millis(500);
-        let delay = base.mul_f64(1.6f64.powi(attempts as i32 - 1));
+        let delay = base.mul_f64(1.6f64.powi(exp as i32));
         delay.min(max)
     }
 }
