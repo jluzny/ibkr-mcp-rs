@@ -1,0 +1,57 @@
+# Maintainer: Jiri Luzny <jiri@luzny.org>
+# IBKR MCP Server — Rust MCP server for Interactive Brokers.
+#
+# Builds from SOURCE (cargo build --release --locked). The previous version just
+# copied a pre-existing target/release binary from a hardcoded path, so makepkg
+# could never produce it on a clean machine.
+#
+# Upstream is PUBLIC: https://github.com/jluzny/ibkr-mcp-rs
+# (an earlier comment here claimed it was private — that was wrong).
+#
+# ⚠️ PINNED to the commit that is actually deployed.
+# The package installed on 2026-09-12 is `0.1.0.r28.de15166-1`, built from commit
+# de15166 on `feat/option-greeks`. That work (stale-session health probe,
+# long-lived account summary subscription, panic-proof reconnect backoff,
+# canary/last-good persistence) is now pushed, so the pin below is reachable
+# from the remote and a clean-machine build reproduces the deployed binary.
+#
+# When bumping: update the commit hash below and re-run makepkg (pkgver() derives
+# the version from the checked-out commit). Note `main` still trails this commit —
+# fast-forward it if you want the default branch to match what is deployed.
+
+pkgname=ibkr-mcp-rs
+pkgver=0.1.0.r28.de15166
+pkgrel=1
+pkgdesc="Interactive Brokers MCP Server in Rust"
+arch=('x86_64')
+url="https://github.com/jluzny/ibkr-mcp-rs"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo' 'git')
+# NOTE: ibapi is a git dependency (wboayue/rust-ibapi), so `cargo fetch` needs
+# network; Cargo.lock pins it (hence --locked, not --frozen).
+#
+source=("ibkr-mcp-rs::git+https://github.com/jluzny/ibkr-mcp-rs.git#commit=de15166d15f2d1bbc2b0460a044a336166941460")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd ibkr-mcp-rs
+  local v
+  v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)
+  printf '%s.r%s.%s' "${v:-0}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd ibkr-mcp-rs
+  cargo fetch --locked
+}
+
+build() {
+  cd ibkr-mcp-rs
+  cargo build --release --locked
+}
+
+package() {
+  cd ibkr-mcp-rs
+  install -Dm755 target/release/ibkr-mcp-rs "$pkgdir/usr/local/bin/ibkr-mcp-rs"
+}
