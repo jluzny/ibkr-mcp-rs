@@ -14,8 +14,11 @@ use rmcp::{
 
 use crate::config::McpConfig;
 use crate::ibkr::account::AccountManager;
+use crate::ibkr::events::EventManager;
+use crate::ibkr::history::HistoricalDataManager;
 use crate::ibkr::market_data::MarketDataManager;
 use crate::ibkr::orders::OrderManager;
+use crate::ibkr::scanner::ScannerManager;
 use crate::mcp::tools::IbkrMcpServer;
 
 use rmcp::ServiceExt;
@@ -77,6 +80,11 @@ pub async fn start_http_on_with_config(
     ));
     let account = Arc::new(AccountManager::new(Arc::clone(&client)));
     let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
+    // Scanner holds a process-wide concurrency semaphore (IBKR allows 10
+    // concurrent scans) — it must be shared across sessions, not per-session.
+    let history = Arc::new(HistoricalDataManager::new(Arc::clone(&client)));
+    let scanner = Arc::new(ScannerManager::new(Arc::clone(&client)));
+    let events = Arc::new(EventManager::new(Arc::clone(&client)));
 
     let service: StreamableHttpService<IbkrMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
@@ -86,6 +94,9 @@ pub async fn start_http_on_with_config(
                     Arc::clone(&market_data),
                     Arc::clone(&account),
                     Arc::clone(&orders),
+                    Arc::clone(&history),
+                    Arc::clone(&scanner),
+                    Arc::clone(&events),
                 ))
             },
             Default::default(),

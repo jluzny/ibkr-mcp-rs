@@ -1,6 +1,7 @@
 //! MCP tool definitions for the IBKR MCP server.
 //!
-//! Implements five MCP tools via the `rmcp` macro-driven router:
+//! Tools are registered via the `rmcp` macro-driven router. Read-only tools
+//! cover quotes, historical/IV bars, scanners and Wall Street Horizon events;
 //!
 //! | Tool | Handler | Description |
 //! |------|---------|-------------|
@@ -26,9 +27,20 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::warn;
 
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use ibapi::market_data::historical::{Duration as IbkrDuration, WhatToShow};
+
 use crate::ibkr::client::IbkrClient;
 use crate::ibkr::error::IbkrError;
+use crate::ibkr::events::EventManager;
+use crate::ibkr::history::{
+    parse_bar_size, parse_date, parse_datetime, BarRequest, HistoricalDataManager, TickKind,
+    TicksRequest,
+};
 use crate::ibkr::market_data::{MarketDataManager, QuoteSource};
+use crate::ibkr::scanner::ScannerManager;
 use crate::ibkr::account::AccountManager;
 use crate::ibkr::orders::OrderManager;
 use crate::ibkr::orders::WhatIfRequest;
@@ -46,6 +58,9 @@ pub struct IbkrMcpServer {
     account: Arc<AccountManager>,
     #[allow(dead_code)]
     orders: Arc<OrderManager>,
+    history: Arc<HistoricalDataManager>,
+    scanner: Arc<ScannerManager>,
+    events: Arc<EventManager>,
     client: Arc<IbkrClient>,
 }
 
@@ -57,12 +72,18 @@ impl IbkrMcpServer {
         ));
         let account = Arc::new(AccountManager::new(Arc::clone(&client)));
         let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
+        let history = Arc::new(HistoricalDataManager::new(Arc::clone(&client)));
+        let scanner = Arc::new(ScannerManager::new(Arc::clone(&client)));
+        let events = Arc::new(EventManager::new(Arc::clone(&client)));
 
         Self {
             tool_router: Self::tool_router(),
             market_data,
             account,
             orders,
+            history,
+            scanner,
+            events,
             client,
         }
     }
@@ -73,12 +94,18 @@ impl IbkrMcpServer {
         market_data: Arc<MarketDataManager>,
         account: Arc<AccountManager>,
         orders: Arc<OrderManager>,
+        history: Arc<HistoricalDataManager>,
+        scanner: Arc<ScannerManager>,
+        events: Arc<EventManager>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             market_data,
             account,
             orders,
+            history,
+            scanner,
+            events,
             client,
         }
     }
@@ -166,6 +193,42 @@ impl IbkrMcpServer {
                         .unwrap_or_default()
                     }
                     Err(e) => {
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({
+                                "success": false,
+                                "symbol": symbol,
+                                "error": e.to_string(),
+                            })
+                        )
+                        .unwrap_or_default()
+                    }
+                }
+            }
+            "historical" => {
+                let period = params.period.clone().unwrap_or_else(|| "1 Y".to_string());
+
+                match self.market_data.get_historical(&symbol, &period).await {
+                    Ok(bars) => serde_json::to_string_pretty(
+                        &serde_json::json!({
+                            "success": true,
+                            "symbol": symbol,
+                            "data_type": "historical",
+                            "period": period,
+                            "count": bars.len(),
+                            "bars": bars.iter().map(|b| serde_json::json!({
+                                "timestamp": b.timestamp,
+                                "open": b.open,
+                                "high": b.high,
+                                "low": b.low,
+                                "close": b.close,
+                                "volume": b.volume,
+                            })).collect::<Vec<_>>(),
+                            "note": "daily TRADES bars; use get_historical_data for IV history, other bar sizes or what_to_show",
+                        })
+                    )
+                    .unwrap_or_default(),
+                    Err(e) => {
+                        warn!(symbol = %symbol, error = %e, "Historical data request failed");
                         serde_json::to_string_pretty(
                             &serde_json::json!({
                                 "success": false,
@@ -575,6 +638,264 @@ impl IbkrMcpServer {
             }
         }
     }
+    /// Get historical bars (OHLCV) for a symbol
+    #[tool(description = "Get historical bar data (OHLCV) for a stock symbol. what_to_show: TRADES, MIDPOINT, BID, ASK, BID_ASK, AGGTRADES, HISTORICAL_VOLATILITY, OPTION_IMPLIED_VOLATILITY, ADJUSTED_LAST. For IV history use bar_size='1 day' with what_to_show='OPTION_IMPLIED_VOLATILITY'. Option price history is NOT available from IBKR.")]
+    async fn get_historical_data(
+        &self,
+        Parameters(params): Parameters<GetHistoricalDataParams>,
+    ) -> String {
+        let symbol = params.symbol.to_uppercase();
+
+        let duration = match IbkrDuration::from_str(params.duration.trim()) {
+            Ok(d) => d,
+            Err(_) => {
+                return error_json(format!(
+                    "invalid duration '{}' — expected an IBKR duration like '1 Y', '6 M', '30 D'",
+                    params.duration
+                ))
+            }
+        };
+
+        let bar_size = match parse_bar_size(&params.bar_size) {
+            Ok(b) => b,
+            Err(e) => return error_json(e),
+        };
+
+        let what_to_show = match WhatToShow::from_str(params.what_to_show.trim()) {
+            Ok(w) => w,
+            Err(_) => {
+                return error_json(format!(
+                    "invalid what_to_show '{}' — expected TRADES, MIDPOINT, BID, ASK, BID_ASK, \
+                     AGGTRADES, HISTORICAL_VOLATILITY, OPTION_IMPLIED_VOLATILITY or ADJUSTED_LAST",
+                    params.what_to_show
+                ))
+            }
+        };
+
+        let end = match parse_datetime(&params.end_datetime) {
+            Ok(e) => e,
+            Err(e) => return error_json(e),
+        };
+
+        let request = BarRequest {
+            duration,
+            bar_size,
+            what_to_show,
+            use_rth: params.use_rth,
+            end,
+        };
+
+        match self.history.get_historical_data(&symbol, &request).await {
+            Ok(series) => serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "symbol": symbol,
+                "whatToShow": what_to_show.to_string(),
+                "barSize": bar_size.to_string(),
+                "duration": duration.to_string(),
+                "useRth": params.use_rth,
+                "count": series.bars.len(),
+                "firstDate": series.first_date,
+                "lastDate": series.last_date,
+                "bars": series.bars,
+            }))
+            .unwrap_or_default(),
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "Historical data request failed");
+                error_json(format!("historical data for {symbol} failed: {e}"))
+            }
+        }
+    }
+
+    /// Get IV rank / IV percentile for a symbol
+    #[tool(description = "Get IV rank and IV percentile for a symbol, computed from 1 year of daily OPTION_IMPLIED_VOLATILITY bars (stocks/ETFs/indices only — IBKR does not serve IV history for option contracts). window (default 252) is the maximum number of daily observations used.")]
+    async fn get_iv_rank(
+        &self,
+        Parameters(params): Parameters<GetIvRankParams>,
+    ) -> String {
+        let symbol = params.symbol.to_uppercase();
+
+        let window = match params.window.trim().parse::<usize>() {
+            Ok(w) if w > 0 => w,
+            _ => {
+                return error_json(format!(
+                    "invalid window '{}' — expected a positive integer, e.g. 252",
+                    params.window
+                ))
+            }
+        };
+
+        match self.history.get_iv_rank(&symbol, window).await {
+            Ok((stats, first_date, last_date)) => {
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "symbol": symbol,
+                    "iv": stats.iv,
+                    "iv_rank_pct": stats.iv_rank_pct,
+                    "iv_percentile": stats.iv_percentile,
+                    "iv_52w_low": stats.iv_52w_low,
+                    "iv_52w_high": stats.iv_52w_high,
+                    "bars": stats.bars,
+                    "windowRequested": stats.window_requested,
+                    "firstDate": first_date,
+                    "lastDate": last_date,
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "IV rank request failed");
+                error_json(format!("IV rank for {symbol} failed: {e}"))
+            }
+        }
+    }
+
+    /// Run an IBKR market scanner
+    #[tool(description = "Run an IBKR market scanner and return ranked symbols. Max 50 rows per scan, max 10 concurrent scans. Scanner rows carry NO price data — fetch quotes separately (get_bulk_quotes / get_option_quote). Example scan codes: HOT_BY_OPT_VOLUME, HIGH_OPT_IMP_VOLAT_OVER_HIST, MOST_ACTIVE, TOP_PERC_GAIN. For multi-leg trades on one underlying: instrument='NATCOMB', location='NATCOMB.OPT.US', scan_code='COMBO_LATEST_TRADE', tag_filters={'underConID': '<conid>'}.")]
+    async fn run_scanner(
+        &self,
+        Parameters(params): Parameters<RunScannerParams>,
+    ) -> String {
+        match self
+            .scanner
+            .run_scan(
+                &params.scan_code,
+                &params.instrument,
+                &params.location,
+                params.rows,
+                &params.tag_filters,
+            )
+            .await
+        {
+            Ok(result) => serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "scanCode": params.scan_code,
+                "instrument": params.instrument,
+                "location": params.location,
+                "requestedRows": params.rows,
+                "rowsReturned": result.rows.len(),
+                "note": "scanner rows carry no market-data fields — fetch prices separately (e.g. get_bulk_quotes)",
+                "notices": result.notices,
+                "rows": result.rows,
+            }))
+            .unwrap_or_default(),
+            Err(e) => {
+                warn!(scan_code = %params.scan_code, error = %e, "Scanner request failed");
+                error_json(format!("scanner '{}' failed: {e}", params.scan_code))
+            }
+        }
+    }
+
+    /// Get Wall Street Horizon event data
+    #[tool(description = "Get Wall Street Horizon event data (earnings / corporate events) for a symbol or contract id. Always reports entitlement explicitly ('entitlement' + 'status' + 'message') instead of returning a silent empty list. Requires a Wall Street Horizon subscription on the IBKR account.")]
+    async fn get_events(
+        &self,
+        Parameters(params): Parameters<GetEventsParams>,
+    ) -> String {
+        let start = if params.start_date.trim().is_empty() {
+            None
+        } else {
+            match parse_date(&params.start_date) {
+                Ok(d) => Some(d),
+                Err(e) => return error_json(e),
+            }
+        };
+        let end = if params.end_date.trim().is_empty() {
+            None
+        } else {
+            match parse_date(&params.end_date) {
+                Ok(d) => Some(d),
+                Err(e) => return error_json(e),
+            }
+        };
+
+        match self
+            .events
+            .get_events(params.symbol.as_deref(), params.conid, start, end)
+            .await
+        {
+            Ok(result) => {
+                let mut value = serde_json::to_value(&result).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("success".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "symbol".to_string(),
+                        serde_json::json!(params.symbol.clone().unwrap_or_default().to_uppercase()),
+                    );
+                }
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            }
+            Err(e) => {
+                warn!(error = %e, "WSH event request failed");
+                error_json(format!("WSH event data request failed: {e}"))
+            }
+        }
+    }
+
+    /// Get historical trade prints (ticks)
+    #[tool(description = "Get historical tick data (trade prints) for a symbol. tick_type: TRADES, MIDPOINT or BID_ASK. Max 1000 ticks; at least one of start_datetime/end_datetime must be set (IBKR requires a time anchor). Entitlement/permission gaps are reported explicitly. IBKR does not serve option price history — use stock/ETF symbols.")]
+    async fn get_historical_ticks(
+        &self,
+        Parameters(params): Parameters<GetHistoricalTicksParams>,
+    ) -> String {
+        let symbol = params.symbol.to_uppercase();
+
+        let kind = match TickKind::parse(&params.tick_type) {
+            Some(k) => k,
+            None => {
+                return error_json(format!(
+                    "invalid tick_type '{}' — expected TRADES, MIDPOINT or BID_ASK",
+                    params.tick_type
+                ))
+            }
+        };
+
+        let start = match parse_datetime(&params.start_datetime) {
+            Ok(v) => v,
+            Err(e) => return error_json(e),
+        };
+        let end = match parse_datetime(&params.end_datetime) {
+            Ok(v) => v,
+            Err(e) => return error_json(e),
+        };
+
+        if start.is_none() && end.is_none() {
+            return error_json(
+                "provide start_datetime and/or end_datetime — IBKR requires a time anchor for historical ticks",
+            );
+        }
+
+        let request = TicksRequest {
+            symbol: symbol.clone(),
+            number_of_ticks: params.number_of_ticks,
+            kind,
+            start,
+            end,
+            use_rth: params.use_rth,
+        };
+
+        match self.history.get_historical_ticks(&request).await {
+            Ok(ticks) => {
+                let count = ticks.len();
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": count > 0,
+                    "symbol": symbol,
+                    "tickType": kind.as_str(),
+                    "count": count,
+                    "status": if count > 0 { "ok" } else { "no_data" },
+                    "note": if count > 0 {
+                        ""
+                    } else {
+                        "no ticks returned — historical ticks need a market-data subscription, and IBKR does not serve option price history at all"
+                    },
+                    "ticks": ticks,
+                }))
+                .unwrap_or_default()
+            }
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "Historical ticks request failed");
+                error_json(format!("historical ticks for {symbol} failed: {e}"))
+            }
+        }
+    }
 }
 
 fn default_mkt() -> String {
@@ -583,6 +904,55 @@ fn default_mkt() -> String {
 
 fn default_quote() -> String {
     "quote".to_string()
+}
+
+fn default_duration() -> String {
+    "1 Y".to_string()
+}
+
+fn default_bar_size() -> String {
+    "1 day".to_string()
+}
+
+fn default_what_to_show() -> String {
+    "TRADES".to_string()
+}
+
+fn default_window() -> String {
+    "252".to_string()
+}
+
+fn default_instrument() -> String {
+    "STK".to_string()
+}
+
+fn default_location() -> String {
+    "STK.US.MAJOR".to_string()
+}
+
+fn default_rows() -> i32 {
+    25
+}
+
+fn default_ticks() -> i32 {
+    100
+}
+
+fn default_tick_type() -> String {
+    "TRADES".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Shared error envelope for the historical / scanner / event tools.
+fn error_json(message: impl std::fmt::Display) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "success": false,
+        "error": message.to_string(),
+    }))
+    .unwrap_or_default()
 }
 
 // ============================================================================
@@ -688,6 +1058,109 @@ pub struct WhatIfParams {
     #[schemars(description = "Account ID. Optional — uses default if omitted.")]
     #[serde(default)]
     pub account_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetHistoricalDataParams {
+    #[schemars(description = "Stock symbol, e.g. WOLF, AAPL")]
+    pub symbol: String,
+
+    #[schemars(description = "IBKR duration string: '<n> S|D|W|M|Y', e.g. '1 Y', '6 M', '30 D'. Defaults to '1 Y'.")]
+    #[serde(default = "default_duration")]
+    pub duration: String,
+
+    #[schemars(description = "Bar size: '1 day', '1 hour', '15 mins', '5 secs', '1 week', '1 month'. Defaults to '1 day'.")]
+    #[serde(default = "default_bar_size")]
+    pub bar_size: String,
+
+    #[schemars(description = "Data type: TRADES (default), MIDPOINT, BID, ASK, BID_ASK, AGGTRADES, HISTORICAL_VOLATILITY, OPTION_IMPLIED_VOLATILITY, ADJUSTED_LAST.")]
+    #[serde(default = "default_what_to_show")]
+    pub what_to_show: String,
+
+    #[schemars(description = "Regular trading hours only. Defaults to true.")]
+    #[serde(default = "default_true")]
+    pub use_rth: bool,
+
+    #[schemars(description = "End of the requested window: '' (now), 'YYYYMMDD', 'YYYY-MM-DD HH:MM:SS' or RFC3339 ('2026-09-16T20:00:00Z'). Optional.")]
+    #[serde(default)]
+    pub end_datetime: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetIvRankParams {
+    #[schemars(description = "Stock symbol, e.g. WOLF, AAPL")]
+    pub symbol: String,
+
+    #[schemars(description = "Maximum number of trailing daily IV observations to use. Defaults to '252'.")]
+    #[serde(default = "default_window")]
+    pub window: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RunScannerParams {
+    #[schemars(description = "Scan code, e.g. HOT_BY_OPT_VOLUME, HIGH_OPT_IMP_VOLAT_OVER_HIST, MOST_ACTIVE, TOP_PERC_GAIN, COMBO_LATEST_TRADE.")]
+    pub scan_code: String,
+
+    #[schemars(description = "Instrument type: 'STK' (default), 'NATCOMB' for multi-leg combos.")]
+    #[serde(default = "default_instrument")]
+    pub instrument: String,
+
+    #[schemars(description = "Location code: 'STK.US.MAJOR' (default), 'NATCOMB.OPT.US' for combo scans.")]
+    #[serde(default = "default_location")]
+    pub location: String,
+
+    #[schemars(description = "Rows to return, 1-50. IBKR rejects more than 50. Defaults to 25.")]
+    #[serde(default = "default_rows")]
+    pub rows: i32,
+
+    #[schemars(description = "Scanner filters as a string map, e.g. {'underConID': '12345'} for NATCOMB combo scans. Optional.")]
+    #[serde(default)]
+    pub tag_filters: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetEventsParams {
+    #[schemars(description = "Stock symbol, e.g. WOLF. Provide this or conid.")]
+    #[serde(default)]
+    pub symbol: Option<String>,
+
+    #[schemars(description = "IBKR contract id (conid). Takes precedence over symbol. Optional.")]
+    #[serde(default)]
+    pub conid: Option<i32>,
+
+    #[schemars(description = "Start date 'YYYYMMDD' or 'YYYY-MM-DD'. Optional.")]
+    #[serde(default)]
+    pub start_date: String,
+
+    #[schemars(description = "End date 'YYYYMMDD' or 'YYYY-MM-DD'. Optional.")]
+    #[serde(default)]
+    pub end_date: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetHistoricalTicksParams {
+    #[schemars(description = "Stock symbol, e.g. AAPL")]
+    pub symbol: String,
+
+    #[schemars(description = "Number of ticks to return, 1-1000. Defaults to 100.")]
+    #[serde(default = "default_ticks")]
+    pub number_of_ticks: i32,
+
+    #[schemars(description = "Tick type: TRADES (default), MIDPOINT or BID_ASK.")]
+    #[serde(default = "default_tick_type")]
+    pub tick_type: String,
+
+    #[schemars(description = "Start of the window: 'YYYYMMDD HH:MM:SS' or RFC3339. Optional (but see end_datetime).")]
+    #[serde(default)]
+    pub start_datetime: String,
+
+    #[schemars(description = "End of the window: 'YYYYMMDD HH:MM:SS' or RFC3339. Optional (but see start_datetime).")]
+    #[serde(default)]
+    pub end_datetime: String,
+
+    #[schemars(description = "Regular trading hours only. Defaults to true.")]
+    #[serde(default = "default_true")]
+    pub use_rth: bool,
 }
 
 // ============================================================================

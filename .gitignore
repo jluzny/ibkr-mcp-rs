@@ -1,2 +1,9 @@
 /target/
 /Cargo.lock
+
+# build/deploy artifacts — packaging/PKGBUILD is tracked source, its byproducts are not
+/dist/
+/packaging/src/
+/packaging/pkg/
+/packaging/ibkr-mcp-rs/
+/packaging/*.pkg.tar.zst

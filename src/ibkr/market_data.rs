@@ -299,21 +299,54 @@ impl MarketDataManager {
         Ok(quote)
     }
 
-    /// Get historical data for a symbol
+    /// Get historical daily TRADES bars for a symbol.
+    ///
+    /// `period` is an IBKR duration string (`"1 Y"`, `"6 M"`, `"30 D"`); it
+    /// defaults to `1 Y`. Delegates to [`crate::ibkr::history::fetch_bars`] so
+    /// the bar-fetching path exists exactly once in the crate.
     pub async fn get_historical(
         &self,
         symbol: &str,
-        _period: &str,
+        period: &str,
     ) -> Result<Vec<HistoricalBar>, IbkrError> {
-        let _client = self.client.get_client().await?;
-        let _contract = Contract::stock(symbol).build();
+        use ibapi::market_data::historical::{BarSize, WhatToShow};
+        use std::str::FromStr;
 
-        info!(symbol = %symbol, "Fetching historical data");
+        let client = self.client.get_client().await?;
+        let contract = Contract::stock(symbol).build();
 
-        // TODO: Implement using ibapi v3's historical_data API
-        Err(IbkrError::Unknown(
-            "Historical data not yet implemented".to_string(),
-        ))
+        let period = if period.trim().is_empty() {
+            "1 Y"
+        } else {
+            period
+        };
+        let duration = ibapi::market_data::historical::Duration::from_str(period)
+            .map_err(|e| IbkrError::Unknown(format!("invalid duration '{period}': {e:?}")))?;
+
+        info!(symbol = %symbol, period = %period, "Fetching historical data");
+
+        let request = crate::ibkr::history::BarRequest {
+            duration,
+            bar_size: BarSize::Day,
+            what_to_show: WhatToShow::Trades,
+            use_rth: true,
+            end: None,
+        };
+
+        let series = crate::ibkr::history::fetch_bars(&client, &contract, &request).await?;
+
+        Ok(series
+            .bars
+            .into_iter()
+            .map(|bar| HistoricalBar {
+                timestamp: bar.date,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume as i64,
+            })
+            .collect())
     }
 
     /// Get quotes for multiple symbols concurrently.
