@@ -9,18 +9,17 @@
 # (an earlier comment here claimed it was private — that was wrong).
 #
 # ⚠️ PINNED to the commit that is actually deployed.
-# The package installed on 2026-09-12 is `0.1.0.r28.de15166-1`, built from commit
-# de15166 on `feat/option-greeks`. That work (stale-session health probe,
-# long-lived account summary subscription, panic-proof reconnect backoff,
-# canary/last-good persistence) is now pushed, so the pin below is reachable
-# from the remote and a clean-machine build reproduces the deployed binary.
+# The package installed on 2026-09-12 was `0.1.0.r28.de15166-1` (feat/option-greeks).
+# This pin is `71230cb` on `main`: ibapi v5.0.0, D4/D5 MCP parity with
+# ibkr-mcp-py (get_open_orders + the read_only/paper_trading gates), and the
+# ibgw-ibc unit retarget (raw API 4001/4002, no socat). `main` now IS the
+# pinned commit.
 #
-# When bumping: update the commit hash below and re-run makepkg (pkgver() derives
-# the version from the checked-out commit). Note `main` still trails this commit —
-# fast-forward it if you want the default branch to match what is deployed.
+# When bumping: update the commit hash below and re-run makepkg (pkgver()
+# derives the version from the checked-out commit).
 
 pkgname=ibkr-mcp-rs
-pkgver=0.1.0.r28.de15166
+pkgver=0.1.0.r33.71230cb
 pkgrel=1
 pkgdesc="Interactive Brokers MCP Server in Rust"
 arch=('x86_64')
@@ -31,7 +30,7 @@ makedepends=('cargo' 'git')
 # NOTE: ibapi is a git dependency (wboayue/rust-ibapi), so `cargo fetch` needs
 # network; Cargo.lock pins it (hence --locked, not --frozen).
 #
-source=("ibkr-mcp-rs::git+https://github.com/jluzny/ibkr-mcp-rs.git#commit=de15166d15f2d1bbc2b0460a044a336166941460")
+source=("ibkr-mcp-rs::git+https://github.com/jluzny/ibkr-mcp-rs.git#commit=71230cb54d4e16aa00f65f4ccfc4ae10342b645d")
 sha256sums=('SKIP')
 
 pkgver() {
