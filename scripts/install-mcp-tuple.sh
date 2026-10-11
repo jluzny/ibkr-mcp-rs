@@ -65,7 +65,10 @@
 #
 # Usage:
 #   cd ~/dev/trading/ibkr-mcp-rs
-#   bash scripts/install-mcp-tuple.sh --mode=snapshot-rollback
+#   --unit=live|paper  selects the tuple (default live): ibkr-mcp.service
+#                      (8881 -> 4001, client 204) or ibkr-mcp-paper.service
+#                      (8882 -> 4002, client 205). One owning installer, both units.
+#   bash scripts/install-mcp-tuple.sh --mode=snapshot-rollback [--unit=paper]
 #   bash scripts/install-mcp-tuple.sh --mode=manifest --binary <qualified build> > /tmp/tuple.properties
 #     (ROLLBACK_NEW_GENERATION / ROLLBACK_PREVIOUS_GENERATION override the
 #      recorded ownership generation; the default 1/0 is the first deployment.
@@ -87,6 +90,20 @@ ROLLBACK_DIR_DEFAULT=$REPO_ROOT/backups/mcp-phase1
 FORWARD_DIR_DEFAULT=$REPO_ROOT/backups/mcp-phase1-forward
 HEALTH_URL_DEFAULT=http://127.0.0.1:8881/health/live
 GATEWAY_UNITS="ibgw-ibc@live.service ibgw-ibc@paper.service"
+
+# --- unit selection: ONE owning installer serves BOTH tuples -----------------
+# `--unit=live` (default) selects ibkr-mcp.service (8881 -> 4001, client 204).
+# `--unit=paper` selects ibkr-mcp-paper.service (8882 -> 4002, client 205).
+# The paper unit carries its restart policy INLINE (Restart=always, RestartSec=30,
+# StartLimit 300/5) - it has no drop-in. The parallel PAPER_* assignments below
+# are load-bearing for the policy gate's STATIC unit-ownership analyzer, which
+# resolves install/mv destinations through simple assignments only: every unit
+# this installer owns needs its own literal words here, or the gate cannot prove
+# that exactly one installer owns it.
+UNIT_SEL=live
+PAPER_UNIT_NAME=ibkr-mcp-paper.service
+PAPER_UNIT_DEST=/etc/systemd/system/$PAPER_UNIT_NAME
+PAPER_UNIT_SRC=$REPO_ROOT/systemd/$PAPER_UNIT_NAME
 
 MODE=check
 MANIFEST=${MANIFEST:-}
@@ -112,6 +129,8 @@ while [ $# -gt 0 ]; do
     --binary) shift; ARTIFACT_BIN_PATH="${1:-}" ;;
     --rollback-dir=*) ROLLBACK_DIR_OVERRIDE="${1#--rollback-dir=}" ;;
     --rollback-dir) shift; ROLLBACK_DIR_OVERRIDE="${1:-}" ;;
+    --unit=*) UNIT_SEL="${1#--unit=}" ;;
+    --unit) shift; UNIT_SEL="${1:-}" ;;
     --from=*) FROM_DIR="${1#--from=}" ;;
     --from) shift; FROM_DIR="${1:-}" ;;
     --restore=package|--restore=forward) RESTORE="${1#--restore=}" ;;
@@ -132,6 +151,27 @@ case "$RESTORE" in
   package|forward) ;;
   *) echo "error: --restore must be package or forward" >&2; usage 2 ;;
 esac
+case "$UNIT_SEL" in
+  live|paper) ;;
+  *) echo "error: --unit must be live or paper (got: ${UNIT_SEL:-<empty>})" >&2; usage 2 ;;
+esac
+# SELECTED tuple's read paths. The install verbs below keep the literal
+# $UNIT_* / $PAPER_UNIT_* words (see the ownership-analyzer note above); these
+# SEL_* values are only ever read, never used as install destinations.
+SEL_UNIT_NAME=$UNIT_NAME
+SEL_UNIT_SRC=$UNIT_SRC
+SEL_UNIT_DEST=$UNIT_DEST
+SEL_DROPIN_SRC=$DROPIN_SRC
+SEL_DROPIN_DEST=$DROPIN_DEST
+if [ "$UNIT_SEL" = paper ]; then
+  SEL_UNIT_NAME=$PAPER_UNIT_NAME
+  SEL_UNIT_SRC=$PAPER_UNIT_SRC
+  SEL_UNIT_DEST=$PAPER_UNIT_DEST
+  SEL_DROPIN_SRC=
+  SEL_DROPIN_DEST=
+  # The paper bridge answers its health endpoints on 8882.
+  HEALTH_URL_DEFAULT=http://127.0.0.1:8882/health/live
+fi
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s ==\n' "$*"; }
@@ -199,10 +239,12 @@ require_root() {
 }
 
 # --- rollback / forward package helpers --------------------------------------
-# A package directory holds exactly three files, named after the role they play
+# A package directory holds up to three files, named after the role they play
 # (the validator maps them by suffix): the unit (*service), the config (*.yaml)
-# and the binary (anything else).
-package_unit()   { printf '%s/%s' "$1" "$UNIT_NAME"; }
+# and the binary (anything else). A FIRST-INSTALL capture has no unit slot: the
+# tuple's unit never existed on this host, so only the shared binary and config
+# are materialized (and the manifest declares rollback_unit_sha256=none).
+package_unit()   { printf '%s/%s' "$1" "$SEL_UNIT_NAME"; }
 package_config() { printf '%s/default.yaml' "$1"; }
 package_bin()    { printf '%s/ibkr-mcp-rs' "$1"; }
 
@@ -215,10 +257,13 @@ package_hashes() {
 
 write_package() {
   # write_package <dir> <binary-src> <unit-src> <config-src>
+  # An EMPTY <unit-src> is the first-install capture described above.
   local dir="$1" bsrc="$2" usrc="$3" csrc="$4"
   mkdir -p "$dir"
   cp -a "$bsrc" "$(package_bin "$dir")"
-  cp -a "$usrc" "$(package_unit "$dir")"
+  if [ -n "$usrc" ]; then
+    cp -a "$usrc" "$(package_unit "$dir")"
+  fi
   cp -a "$csrc" "$(package_config "$dir")"
 }
 
@@ -290,9 +335,20 @@ verify_manifest_against_host() {
     [ "$(sha256_of "$(package_bin "$rdir")")" = "$(manifest_value rollback_binary_sha256)" ] \
       && ok "rollback package binary matches rollback_binary_sha256" \
       || bad "rollback package binary does not match rollback_binary_sha256"
-    [ "$(sha256_of "$(package_unit "$rdir")")" = "$(manifest_value rollback_unit_sha256)" ] \
-      && ok "rollback package unit matches rollback_unit_sha256" \
-      || bad "rollback package unit does not match rollback_unit_sha256"
+    # The unit slot: a FIRST-INSTALL package has none (the tuple's unit never
+    # existed here), and the manifest records that absence as 'none' - a value
+    # that can never silently stand in for a checksum.
+    local rb_unit_sha
+    rb_unit_sha="$(sha256_of "$(package_unit "$rdir")" || true)"
+    if [ -z "$rb_unit_sha" ]; then
+      [ "$(manifest_value rollback_unit_sha256)" = "none" ] \
+        && ok "first-install rollback package: no predecessor unit (rollback_unit_sha256=none)" \
+        || bad "rollback package has no unit slot but rollback_unit_sha256='$(manifest_value rollback_unit_sha256)' (must declare none)"
+    else
+      [ "$rb_unit_sha" = "$(manifest_value rollback_unit_sha256)" ] \
+        && ok "rollback package unit matches rollback_unit_sha256" \
+        || bad "rollback package unit does not match rollback_unit_sha256"
+    fi
     [ "$(sha256_of "$(package_config "$rdir")")" = "$(manifest_value rollback_config_sha256)" ] \
       && ok "rollback package config matches rollback_config_sha256" \
       || bad "rollback package config does not match rollback_config_sha256"
@@ -317,9 +373,42 @@ mode_manifest() {
   version="$(sed -n 's/^[[:space:]]*contract_version[[:space:]]*:[[:space:]]*//p' "$config" | tail -1 | tr -d ' "'"'"'')"
   [ -n "$version" ] || die "config/default.yaml declares no contract_version (plan §6.1)"
   local client_id
-  client_id="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_IBKR__CLIENT_ID[[:space:]]*=[[:space:]]*//p' "$UNIT_SRC" | tail -1 | tr -d ' ')"
+  client_id="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_IBKR__CLIENT_ID[[:space:]]*=[[:space:]]*//p' "$SEL_UNIT_SRC" | tail -1 | tr -d ' ')"
   local broker_port
-  broker_port="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_IBKR__PORT[[:space:]]*=[[:space:]]*//p' "$UNIT_SRC" | tail -1 | tr -d ' ')"
+  broker_port="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_IBKR__PORT[[:space:]]*=[[:space:]]*//p' "$SEL_UNIT_SRC" | tail -1 | tr -d ' ')"
+  # Per-tuple state paths come from the unit itself when it declares them (the
+  # paper unit does - /var/lib/ibkr-mcp-paper/... - the live unit keeps the
+  # historical /tmp defaults).
+  local persist_path heartbeat_path
+  persist_path="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_PERSIST_PATH[[:space:]]*=[[:space:]]*//p' "$SEL_UNIT_SRC" | tail -1 | tr -d ' ')"
+  heartbeat_path="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*IBKR_MCP_HEARTBEAT_PATH[[:space:]]*=[[:space:]]*//p' "$SEL_UNIT_SRC" | tail -1 | tr -d ' ')"
+  : "${persist_path:=/tmp/ibkr-mcp-last-good.json}"
+  : "${heartbeat_path:=/tmp/ibkr-mcp-heartbeat}"
+  # Rollback-slot hashes of the captured package. An absent slot declares the
+  # sentinel `none` - required keys must be non-empty, no *service file exists
+  # for the gate to compare it against, and 'none' can never silently stand in
+  # for a checksum (verify_manifest_against_host enforces exactly this).
+  local rb_binary_sha rb_unit_sha rb_config_sha park_reason
+  # `|| true`: sha256_of is a sha256sum|cut pipeline under pipefail, so a MISSING
+  # file exits 1 - and a bare `v=$(...)` assignment then aborts the script under
+  # set -e with no message. An absent slot must yield empty (-> `none` below).
+  rb_binary_sha="$(sha256_of "$(package_bin "$rdir")" || true)"
+  rb_unit_sha="$(sha256_of "$(package_unit "$rdir")" || true)"
+  rb_config_sha="$(sha256_of "$(package_config "$rdir")" || true)"
+  [ -n "$rb_unit_sha" ]    || rb_unit_sha=none
+  [ -n "$rb_binary_sha" ]  || rb_binary_sha=none
+  [ -n "$rb_config_sha" ]  || rb_config_sha=none
+  park_reason="park is the standing policy of this refactor: a rollback restores the replaced tuple's binary and config but never reinstates a Gateway activation edge or a weaker restart policy (plan 6.3 step 9). It is recorded per deployment, because the tuple being replaced changes even when the policy does not."
+  if [ "$rb_unit_sha" = none ]; then
+    park_reason="FIRST INSTALL of $SEL_UNIT_NAME: no predecessor unit exists on this host (rollback_unit_sha256=none records the absence). A rollback of this tuple REMOVES the installed unit and restores absence; the shared binary and config are not touched, they belong to the replaced tuple's own rollback package (plan 6.3 step 9)."
+  fi
+  # section 6.3 step 7: a client id other than the documented service id 204
+  # must declare WHERE its migration is recorded. Override the reference text
+  # with CLIENT_ID_MIGRATION_REF='<ref>'. An empty line is inert in the manifest.
+  local migration_ref_line=""
+  if [ "$client_id" != "204" ]; then
+    migration_ref_line="client_id_migration_ref=${CLIENT_ID_MIGRATION_REF:-client id $client_id for $SEL_UNIT_NAME is the per-instance id fixed by the 2026-10-11 ibgw-ibc retarget (one client id per gateway instance: live=204, paper=205); see systemd/$SEL_UNIT_NAME and PLAN-paper-unit-owning-installer.md}"
+  fi
   cat <<EOF
 # Qualified ibkr-mcp artifact tuple, generated at $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # by $(basename "${BASH_SOURCE[0]}") --mode=manifest
@@ -331,52 +420,68 @@ cargo_lock_sha256=$(sha256_of "$REPO_ROOT/Cargo.lock")
 rustc_version=$(rustc --version 2>/dev/null || echo unknown)
 binary_path=$bin
 binary_sha256=$(sha256_of "$bin")
-unit_path=$UNIT_SRC
-unit_sha256=$(sha256_of "$UNIT_SRC")
+unit_path=$SEL_UNIT_SRC
+unit_sha256=$(sha256_of "$SEL_UNIT_SRC")
 config_path=$config
 config_sha256=$(sha256_of "$config")
 health_contract_version=$version
 client_id=$client_id
+$migration_ref_line
 broker_endpoint_mode=proxy
 broker_port=$broker_port
-persist_path=/tmp/ibkr-mcp-last-good.json
-heartbeat_path=/tmp/ibkr-mcp-heartbeat
+persist_path=$persist_path
+heartbeat_path=$heartbeat_path
 owning_installer=$REPO_ROOT/scripts/install-mcp-tuple.sh
 rollback_mode=park
-rollback_park_reason=park is the standing policy of this refactor: a rollback restores the replaced tuple's binary and config but never reinstates a Gateway activation edge or a weaker restart policy (plan 6.3 step 9). It is recorded per deployment, because the tuple being replaced changes even when the policy does not.
+rollback_park_reason=$park_reason
 rollback_dir=$rdir
 rollback_new_generation=${ROLLBACK_NEW_GENERATION:-1}
 rollback_previous_generation=${ROLLBACK_PREVIOUS_GENERATION:-0}
 rollback_restores_activation_edge=no
 rollback_restores_restart_sec=no
-rollback_binary_sha256=$(sha256_of "$(package_bin "$rdir")")
-rollback_unit_sha256=$(sha256_of "$(package_unit "$rdir")")
-rollback_config_sha256=$(sha256_of "$(package_config "$rdir")")
+rollback_binary_sha256=$rb_binary_sha
+rollback_unit_sha256=$rb_unit_sha
+rollback_config_sha256=$rb_config_sha
 EOF
 }
 
 mode_snapshot_rollback() {
   local rdir="${ROLLBACK_DIR_OVERRIDE:-$ROLLBACK_DIR_DEFAULT}"
-  local cur_bin="$INSTALL_BIN_DEST" cur_unit="$UNIT_DEST" cur_config="$REPO_ROOT/config/default.yaml"
+  local cur_bin="$INSTALL_BIN_DEST" cur_unit="$SEL_UNIT_DEST" cur_config="$REPO_ROOT/config/default.yaml"
   [ -f "$cur_bin" ] || die "no installed binary at $cur_bin"
-  [ -f "$cur_unit" ] || die "no installed unit at $cur_unit"
   [ -f "$cur_config" ] || die "no config at $cur_config"
+  local first_install=0
+  if [ ! -f "$cur_unit" ]; then
+    first_install=1
+    step "FIRST INSTALL of $SEL_UNIT_NAME: no installed unit at $cur_unit"
+    say "capturing the shared pre-deploy binary and config only - there is no"
+    say "predecessor unit to preserve. The manifest will declare rollback_unit_sha256=none."
+  fi
   if [ -d "$rdir" ] && [ -n "$(ls -A "$rdir" 2>/dev/null || true)" ] && [ "$FORCE" -ne 1 ]; then
     die "rollback package $rdir is not empty; re-run with --force to overwrite"
   fi
-  if [ "$(id -u)" -ne 0 ] && [ ! -r "$cur_unit" ]; then
+  if [ "$first_install" -eq 0 ] && [ "$(id -u)" -ne 0 ] && [ ! -r "$cur_unit" ]; then
     step "re-executing under sudo to read the installed unit"
     exec sudo -- "$0" "$@" --force
   fi
   step "materializing the pre-install rollback package into $rdir"
-  write_package "$rdir" "$cur_bin" "$cur_unit" "$cur_config"
+  if [ "$first_install" -eq 1 ]; then
+    write_package "$rdir" "$cur_bin" "" "$cur_config"
+  else
+    write_package "$rdir" "$cur_bin" "$cur_unit" "$cur_config"
+  fi
   ls -l "$rdir"
   package_hashes "$rdir"
   say ""
   # Say what is actually true of THIS package: the park rationale is about the
   # activation edge, and a package whose unit has none (a redeployment after the
   # edge was removed) must not be described as if it had one.
-  if grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*(gateway|ibgw-ibc)' "$cur_unit"; then
+  if [ "$first_install" -eq 1 ]; then
+    say "This is a FIRST INSTALL. The package records the shared pre-deploy artifacts;"
+    say "the unit slot is absent and rollback_unit_sha256=none. A rollback of this"
+    say "tuple removes the installed unit and restores absence (park policy: no"
+    say "predecessor is ever installed, no activation edge, no weaker restart policy)."
+  elif grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*(gateway|ibgw-ibc)' "$cur_unit"; then
     say "This is the tuple being REPLACED. Its unit CARRIES the Gateway activation"
     say "edge, so rollback_mode=park applies: a rollback restores its binary/config"
     say "only, never the unit."
@@ -394,14 +499,16 @@ mode_install() {
   verify_manifest_against_host
   [ "$FAILS" -eq 0 ] || die "tuple verification failed ($FAILS FAILs) - nothing installed"
 
-  local unit_dest_src="$UNIT_SRC" bin_src config_src
+  local unit_dest_src="$SEL_UNIT_SRC" bin_src config_src
   bin_src="$(manifest_value binary_path)"
   config_src="$(manifest_value config_path)"
 
   local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
   local dated="$REPO_ROOT/backups/$stamp-pre-install"
+  local cur_unit_slot="$SEL_UNIT_DEST"
+  [ -f "$SEL_UNIT_DEST" ] || cur_unit_slot=
   step "dated backup of what is being replaced -> $dated"
-  write_package "$dated" "$INSTALL_BIN_DEST" "$UNIT_DEST" "$config_src"
+  write_package "$dated" "$INSTALL_BIN_DEST" "$cur_unit_slot" "$config_src"
 
   step "forward package (what a rollback would return to) -> $FORWARD_DIR_DEFAULT"
   write_package "$FORWARD_DIR_DEFAULT" "$bin_src" "$unit_dest_src" "$config_src"
@@ -409,12 +516,18 @@ mode_install() {
   step "installing atomically (unit first, then binary; the running process is untouched)"
   # Unit first: new unit + old binary is a bounded-restart combination, whereas
   # old unit + new binary would carry the activation edge into the next start.
-  install -m 0644 -o root -g root "$unit_dest_src" "/etc/systemd/system/.$UNIT_NAME.new"
-  mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
-  say "  unit     -> $UNIT_DEST"
-  if [ -f "$DROPIN_DEST" ]; then
-    say "  removing superseded drop-in $DROPIN_DEST"
-    rm -f "$DROPIN_DEST"
+  # Each unit's install keeps its own literal words (ownership-analyzer note).
+  if [ "$UNIT_SEL" = paper ]; then
+    install -m 0644 -o root -g root "$PAPER_UNIT_SRC" "/etc/systemd/system/.$PAPER_UNIT_NAME.new"
+    mv -f "/etc/systemd/system/.$PAPER_UNIT_NAME.new" "$PAPER_UNIT_DEST"
+  else
+    install -m 0644 -o root -g root "$UNIT_SRC" "/etc/systemd/system/.$UNIT_NAME.new"
+    mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
+  fi
+  say "  unit     -> $SEL_UNIT_DEST"
+  if [ -n "${SEL_DROPIN_DEST:-}" ] && [ -f "$SEL_DROPIN_DEST" ]; then
+    say "  removing superseded drop-in $SEL_DROPIN_DEST"
+    rm -f "$SEL_DROPIN_DEST"
     rmdir "$DROPIN_DEST_DIR" 2>/dev/null || true
   fi
   install -m 0755 -o root -g root "$bin_src" "/usr/local/bin/.ibkr-mcp-rs.new"
@@ -423,10 +536,10 @@ mode_install() {
   say "  config   -> $config_src (deployed in place; hash verified above and below)"
 
   systemctl daemon-reload
-  systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || true
+  systemctl enable "$SEL_UNIT_NAME" >/dev/null 2>&1 || true
 
   step "post-install artifact check"
-  [ "$(sha256_of "$UNIT_DEST")" = "$(manifest_value unit_sha256)" ] \
+  [ "$(sha256_of "$SEL_UNIT_DEST")" = "$(manifest_value unit_sha256)" ] \
     && ok "installed unit matches unit_sha256" || bad "installed unit does not match unit_sha256"
   [ "$(sha256_of "$INSTALL_BIN_DEST")" = "$(manifest_value binary_sha256)" ] \
     && ok "installed binary matches binary_sha256" || bad "installed binary does not match binary_sha256"
@@ -434,44 +547,57 @@ mode_install() {
     && ok "config still matches config_sha256" || bad "config no longer matches config_sha256"
 
   step "effective systemd graph (plan §6.1: no Gateway activation edge)"
-  systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
+  systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths
+  if systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph still activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"
   fi
   if command -v systemd-analyze >/dev/null 2>&1; then
-    systemd-analyze verify "$UNIT_NAME" >/dev/null 2>&1 \
-      && ok "systemd-analyze verify accepts $UNIT_NAME" \
-      || warn "systemd-analyze verify reported issues for $UNIT_NAME"
+    systemd-analyze verify "$SEL_UNIT_NAME" >/dev/null 2>&1 \
+      && ok "systemd-analyze verify accepts $SEL_UNIT_NAME" \
+      || warn "systemd-analyze verify reported issues for $SEL_UNIT_NAME"
   fi
   [ "$FAILS" -eq 0 ] || die "post-install checks failed ($FAILS FAILs)"
   say ""
   say "Installed. The RUNNING process is untouched: no start, stop or restart was"
-  say "issued. Restarting $UNIT_NAME is a separate, explicitly approved action"
+  say "issued. Restarting $SEL_UNIT_NAME is a separate, explicitly approved action"
   say "(plan §6.3 step 5)."
 }
 
 mode_unit() {
   [ -n "$MANIFEST" ] && { verify_manifest_against_host; [ "$FAILS" -eq 0 ] || die "tuple verification failed"; }
   require_root "$@"
-  step "installing the unit only"
-  install -m 0644 -o root -g root "$UNIT_SRC" "/etc/systemd/system/.$UNIT_NAME.new"
-  mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
+  step "installing the unit only ($SEL_UNIT_NAME)"
+  # Each unit's install keeps its own literal words (ownership-analyzer note).
+  if [ "$UNIT_SEL" = paper ]; then
+    install -m 0644 -o root -g root "$PAPER_UNIT_SRC" "/etc/systemd/system/.$PAPER_UNIT_NAME.new"
+    mv -f "/etc/systemd/system/.$PAPER_UNIT_NAME.new" "$PAPER_UNIT_DEST"
+  else
+    install -m 0644 -o root -g root "$UNIT_SRC" "/etc/systemd/system/.$UNIT_NAME.new"
+    mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
+  fi
   systemctl daemon-reload
-  systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
+  systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath
+  if systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph still activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"
   fi
   [ "$FAILS" -eq 0 ] || die "post-install checks failed"
-  say "done. Takes effect on the next approved start/restart of $UNIT_NAME."
+  say "done. Takes effect on the next approved start/restart of $SEL_UNIT_NAME."
 }
 
 mode_dropin() {
   require_root "$@"
-  [ -f "$DROPIN_SRC" ] || die "missing $DROPIN_SRC"
+  if [ -z "${SEL_DROPIN_SRC:-}" ]; then
+    step "restart-policy drop-in for $SEL_UNIT_NAME"
+    say "nothing to install: $SEL_UNIT_NAME carries its restart policy INLINE in the"
+    say "unit file (Restart=always, RestartSec=30, StartLimitIntervalSec=300,"
+    say "StartLimitBurst=5) - the same contract as the live unit's drop-in."
+    return 0
+  fi
+  [ -f "$SEL_DROPIN_SRC" ] || die "missing $SEL_DROPIN_SRC"
   step "installing the restart-policy drop-in only"
   install -d -m 0755 "$DROPIN_DEST_DIR"
   install -m 0644 -o root -g root "$DROPIN_SRC" "$DROPIN_DEST"
@@ -493,19 +619,19 @@ mode_verify() {
     [ "$(sha256_of "$INSTALL_BIN_DEST")" = "$(manifest_value binary_sha256)" ] \
       && ok "installed $INSTALL_BIN_DEST matches the manifest binary" \
       || bad "installed $INSTALL_BIN_DEST does not match the manifest binary"
-    [ "$(sha256_of "$UNIT_DEST")" = "$(manifest_value unit_sha256)" ] \
-      && ok "installed $UNIT_DEST matches the manifest unit" \
-      || bad "installed $UNIT_DEST does not match the manifest unit"
+    [ "$(sha256_of "$SEL_UNIT_DEST")" = "$(manifest_value unit_sha256)" ] \
+      && ok "installed $SEL_UNIT_DEST matches the manifest unit" \
+      || bad "installed $SEL_UNIT_DEST does not match the manifest unit"
   else
     warn "no manifest given: reporting installed state only"
     say "  $INSTALL_BIN_DEST sha256 $(sha256_of "$INSTALL_BIN_DEST")"
-    say "  $UNIT_DEST sha256 $(sha256_of "$UNIT_DEST")"
+    say "  $SEL_UNIT_DEST sha256 $(sha256_of "$SEL_UNIT_DEST")"
     say "  config sha256 $(sha256_of "$REPO_ROOT/config/default.yaml")"
   fi
 
   step "effective systemd graph"
-  systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths -p ExecMainStartTimestamp -p InvocationID -p NRestarts
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
+  systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths -p ExecMainStartTimestamp -p InvocationID -p NRestarts
+  if systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"
@@ -513,7 +639,7 @@ mode_verify() {
 
   step "running process identity"
   local main_pid
-  main_pid="$(systemctl show "$UNIT_NAME" -p MainPID --value)"
+  main_pid="$(systemctl show "$SEL_UNIT_NAME" -p MainPID --value || true)"
   if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
     say "  MainPID=$main_pid"
     ls -l "/proc/$main_pid/exe" 2>/dev/null || true
@@ -549,7 +675,9 @@ mode_verify() {
     say ""
   done
   local reported
-  reported="$(curl -s --max-time 5 "$base/version" | sed -n 's/.*"contractVersion":"\([^"]*\)".*/\1/p')"
+  # `|| true`: under pipefail a dead endpoint makes this bare assignment abort
+  # the whole verify under set -e - evidence collection must survive a down bridge.
+  reported="$(curl -s --max-time 5 "$base/version" | sed -n 's/.*"contractVersion":"\([^"]*\)".*/\1/p' || true)"
   if [ -n "$MANIFEST" ]; then
     [ "$reported" = "$(manifest_value health_contract_version)" ] \
       && ok "running process reports contractVersion=$reported" \
@@ -568,20 +696,33 @@ mode_rollback() {
     forward) dir="${FROM_DIR:-$FORWARD_DIR_DEFAULT}" ;;
   esac
   [ -d "$dir" ] || die "package directory not found: $dir"
-  local pkg_bin pkg_unit pkg_config
+  local pkg_bin pkg_unit pkg_config pkg_shape
   pkg_bin="$(package_bin "$dir")"; pkg_unit="$(package_unit "$dir")"; pkg_config="$(package_config "$dir")"
-  [ -f "$pkg_bin" ] && [ -f "$pkg_unit" ] && [ -f "$pkg_config" ] \
-    || die "package $dir is incomplete (need $(basename "$pkg_bin"), $(basename "$pkg_unit"), $(basename "$pkg_config"))"
+  pkg_shape=triple
+  [ -f "$pkg_unit" ] || pkg_shape=first-install
+  if [ "$pkg_shape" = triple ]; then
+    [ -f "$pkg_bin" ] && [ -f "$pkg_unit" ] && [ -f "$pkg_config" ] \
+      || die "package $dir is incomplete (need $(basename "$pkg_bin"), $(basename "$pkg_unit"), $(basename "$pkg_config"))"
+  else
+    [ -f "$pkg_bin" ] && [ -f "$pkg_config" ] \
+      || die "first-install package $dir is incomplete (need $(basename "$pkg_bin"), $(basename "$pkg_config"))"
+  fi
 
-  step "rollback source: $dir ($RESTORE)"
+  step "rollback source: $dir ($RESTORE, $pkg_shape)"
   ls -l "$dir"
   package_hashes "$dir"
 
   # §6.3 step 9: a rollback must preserve the safety invariants active at this
   # stage. The pre-install unit carries the Gateway activation edge, so it is
-  # parked, never restored.
+  # parked, never restored. A FIRST-INSTALL package has no predecessor unit at
+  # all: the rollback removes the installed unit and restores absence - the
+  # shared binary/config belong to the replaced tuple's own rollback package.
   local restore_unit=1
-  if grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*gateway' "$pkg_unit"; then
+  if [ "$pkg_shape" = first-install ]; then
+    restore_unit=0
+    warn "FIRST INSTALL: no predecessor unit exists - $SEL_UNIT_NAME is REMOVED (absence restored)"
+    warn "the shared binary and config are NOT touched (they belong to the replaced tuple's rollback)"
+  elif grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*gateway' "$pkg_unit"; then
     restore_unit=0
     warn "PARK: $pkg_unit carries a Gateway activation edge - the unit is NOT restored"
     warn "PARK: restoring it would violate the Phase-1 no-Gateway-activation invariant"
@@ -595,27 +736,43 @@ mode_rollback() {
   step "gateway identity BEFORE (must be identical after)"
   systemctl show $GATEWAY_UNITS -p InvocationID -p ActiveEnterTimestamp -p MainPID
 
-  step "stopping $UNIT_NAME (MCP only)"
-  systemctl stop "$UNIT_NAME" || true
+  step "stopping $SEL_UNIT_NAME (MCP only)"
+  systemctl stop "$SEL_UNIT_NAME" || true
   say "  stopped at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   step "restoring the package artifacts"
+  if [ "$pkg_shape" = first-install ]; then
+    rm -f "$SEL_UNIT_DEST"
+    [ -n "${SEL_DROPIN_DEST:-}" ] && rm -f "$SEL_DROPIN_DEST"
+    say "  unit     -> REMOVED (absence restored; nothing shared was touched)"
+  else
   install -m 0755 -o root -g root "$pkg_bin" "/usr/local/bin/.ibkr-mcp-rs.new"
   mv -f "/usr/local/bin/.ibkr-mcp-rs.new" "$INSTALL_BIN_DEST"
   say "  binary   -> $INSTALL_BIN_DEST ($(sha256_of "$INSTALL_BIN_DEST"))"
   if [ "$restore_unit" -eq 1 ]; then
-    install -m 0644 -o root -g root "$pkg_unit" "/etc/systemd/system/.$UNIT_NAME.new"
-    mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
-    say "  unit     -> $UNIT_DEST ($(sha256_of "$UNIT_DEST"))"
+    # Each unit's restore keeps its own literal words (ownership-analyzer note).
+    if [ "$UNIT_SEL" = paper ]; then
+      install -m 0644 -o root -g root "$pkg_unit" "/etc/systemd/system/.$PAPER_UNIT_NAME.new"
+      mv -f "/etc/systemd/system/.$PAPER_UNIT_NAME.new" "$PAPER_UNIT_DEST"
+    else
+      install -m 0644 -o root -g root "$pkg_unit" "/etc/systemd/system/.$UNIT_NAME.new"
+      mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
+    fi
+    say "  unit     -> $SEL_UNIT_DEST ($(sha256_of "$SEL_UNIT_DEST"))"
   else
-    say "  unit     -> PARKED (kept: $(sha256_of "$UNIT_DEST"))"
+    say "  unit     -> PARKED (kept: $(sha256_of "$SEL_UNIT_DEST"))"
   fi
   cp -a "$pkg_config" "$REPO_ROOT/config/default.yaml"
   say "  config   -> $REPO_ROOT/config/default.yaml ($(sha256_of "$REPO_ROOT/config/default.yaml"))"
+  fi
   systemctl daemon-reload
 
-  step "starting $UNIT_NAME (MCP only, never the Gateway)"
-  systemctl start "$UNIT_NAME"
+  if [ "$pkg_shape" = first-install ]; then
+    step "nothing to start"
+    say "$SEL_UNIT_NAME was removed by this rollback; no start is issued."
+  else
+  step "starting $SEL_UNIT_NAME (MCP only, never the Gateway)"
+  systemctl start "$SEL_UNIT_NAME"
   say "  started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local base="${HEALTH_URL:-$HEALTH_URL_DEFAULT}"; base="${base%/health/live}"
   local ready=0
@@ -626,7 +783,8 @@ mode_rollback() {
   [ "$ready" -eq 1 ] && ok "$base/health/live answered 200" || bad "$base/health/live did not answer within 30s"
   say "  /health/live  $(curl -s --max-time 5 "$base/health/live" || echo ERR)"
   say "  /version      $(curl -s --max-time 5 "$base/version" || echo ERR)"
-  systemctl show "$UNIT_NAME" -p Requires -p Wants -p InvocationID -p NRestarts
+  systemctl show "$SEL_UNIT_NAME" -p Requires -p Wants -p InvocationID -p NRestarts
+  fi
 
   step "gateway identity AFTER (must equal BEFORE)"
   systemctl show $GATEWAY_UNITS -p InvocationID -p ActiveEnterTimestamp -p MainPID
