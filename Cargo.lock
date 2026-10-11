@@ -307,7 +307,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -597,8 +597,8 @@ dependencies = [
 
 [[package]]
 name = "ibapi"
-version = "3.3.0"
-source = "git+https://github.com/wboayue/rust-ibapi?branch=main#29eaf33ab9531ae1ae51eb2f57368124a183d2b2"
+version = "5.0.0"
+source = "git+https://github.com/wboayue/rust-ibapi?tag=v5.0.0#f43c64682ab24b822dcd2892ff4208eac81813dc"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -1138,7 +1138,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

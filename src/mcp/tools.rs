@@ -10,6 +10,7 @@
 //! | `get_account_info` | `IbkrMcpServer::get_account_info` | Account summary (net liquidation, funds, PnL) |
 //! | `get_positions` | `IbkrMcpServer::get_positions` | Current holdings per account |
 //! | `get_connection_status` | `IbkrMcpServer::get_connection_status` | IBKR gateway connectivity |
+//! | `get_open_orders` | `IbkrMcpServer::get_open_orders` | Orders the broker reports open (D4, read-only) |
 //!
 //! All tools return JSON strings that the MCP client receives as text content.
 //! Error responses include `"success": false` and an `"error"` field.
@@ -62,19 +63,24 @@ pub struct IbkrMcpServer {
     scanner: Arc<ScannerManager>,
     events: Arc<EventManager>,
     client: Arc<IbkrClient>,
+    /// The D5 flag gate — refuses `what_if` under an explicit `read_only` and a
+    /// non-paper `account_id` on the account-scoped tools under an explicit
+    /// `paper_trading` (see [`crate::policy`]).
+    gate: Arc<crate::policy::OrderGate>,
 }
 
 impl IbkrMcpServer {
-    pub fn new(client: Arc<IbkrClient>) -> Self {
+    pub fn new(client: Arc<IbkrClient>, config: Arc<crate::config::Config>) -> Self {
         let market_data = Arc::new(MarketDataManager::new(
             Arc::clone(&client),
-            crate::config::Config::default().market_data,
+            config.market_data.clone(),
         ));
         let account = Arc::new(AccountManager::new(Arc::clone(&client)));
         let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
         let history = Arc::new(HistoricalDataManager::new(Arc::clone(&client)));
         let scanner = Arc::new(ScannerManager::new(Arc::clone(&client)));
         let events = Arc::new(EventManager::new(Arc::clone(&client)));
+        let gate = Arc::new(crate::policy::OrderGate::from_config(&config));
 
         Self {
             tool_router: Self::tool_router(),
@@ -85,6 +91,7 @@ impl IbkrMcpServer {
             scanner,
             events,
             client,
+            gate,
         }
     }
 
@@ -97,6 +104,7 @@ impl IbkrMcpServer {
         history: Arc<HistoricalDataManager>,
         scanner: Arc<ScannerManager>,
         events: Arc<EventManager>,
+        gate: Arc<crate::policy::OrderGate>,
     ) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -107,15 +115,18 @@ impl IbkrMcpServer {
             scanner,
             events,
             client,
+            gate,
         }
     }
 }
 
 impl Default for IbkrMcpServer {
     fn default() -> Self {
-        Self::new(IbkrClient::new(
-            crate::config::Config::default().ibkr
-        ))
+        let config = crate::config::Config::default();
+        Self::new(
+            IbkrClient::new(config.ibkr.clone()),
+            Arc::new(config),
+        )
     }
 }
 
@@ -318,6 +329,9 @@ impl IbkrMcpServer {
         &self,
         Parameters(params): Parameters<GetAccountInfoParams>,
     ) -> String {
+        if let Some(refusal) = self.gate.refusal_for("get_account_info", params.account_id.as_deref()) {
+            return error_json(refusal);
+        }
         let account_id = params.account_id.as_deref();
 
         match self.account.get_account_info(account_id).await {
@@ -354,6 +368,9 @@ impl IbkrMcpServer {
         &self,
         Parameters(params): Parameters<GetPositionsParams>,
     ) -> String {
+        if let Some(refusal) = self.gate.refusal_for("get_positions", params.account_id.as_deref()) {
+            return error_json(refusal);
+        }
         let account_id = params.account_id.as_deref();
 
         match self.account.get_positions(account_id).await {
@@ -395,6 +412,9 @@ impl IbkrMcpServer {
         &self,
         Parameters(params): Parameters<GetExecutionsParams>,
     ) -> String {
+        if let Some(refusal) = self.gate.refusal_for("get_executions", params.account_id.as_deref()) {
+            return error_json(refusal);
+        }
         let account_id = params.account_id.as_deref();
         let symbol = params.symbol.as_deref();
         let since = params.since.as_deref();
@@ -440,16 +460,30 @@ impl IbkrMcpServer {
     }
 
     /// Get IBKR connection status
+    ///
+    /// Always answers promptly, including while the broker is unreachable: this
+    /// is the cheap "is the broker up?" probe for cron jobs. `brokerConnected:
+    /// false` is a normal answer, not an error — the bridge stays up and
+    /// reconnects on its own (see docs/broker-outage-policy.md).
     #[tool(description = "Check if the IBKR broker connection is active.")]
     async fn get_connection_status(
         &self,
         _params: Parameters<GetConnectionStatusParams>,
     ) -> String {
         let connected = self.client.is_connected().await;
+        let consecutive_failures = self.client.broker_failures();
+        let outage_secs = self.client.broker_outage_secs();
         serde_json::to_string_pretty(
             &serde_json::json!({
                 "success": true,
                 "brokerConnected": connected,
+                "consecutiveFailures": consecutive_failures,
+                "outageSeconds": outage_secs,
+                "message": if connected {
+                    "connected to IBKR"
+                } else {
+                    "not connected to IBKR — the bridge is up and reconnecting in the background; broker-backed tools will fail until the gateway is logged in"
+                },
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             })
         )
@@ -588,6 +622,9 @@ impl IbkrMcpServer {
         &self,
         Parameters(params): Parameters<WhatIfParams>,
     ) -> String {
+        if let Some(refusal) = self.gate.refusal_for("what_if", params.account_id.as_deref()) {
+            return error_json(refusal);
+        }
         let req = WhatIfRequest {
             symbol: params.symbol.to_uppercase(),
             action: params.action.to_uppercase(),
@@ -896,6 +933,28 @@ impl IbkrMcpServer {
             }
         }
     }
+
+    /// Get the orders the broker currently reports as open (the D4 read)
+    ///
+    /// Strictly read-only: it can never place, modify or cancel an order. A
+    /// failed read is an error envelope, never an empty list — `orders: []` is
+    /// what an empty book looks like.
+    #[tool(description = "Get the orders the broker currently reports as open, with order id, symbol/conId, side, quantity, limit price, time-in-force, status, filled/remaining, outside-RTH flag and order ref. STRICTLY READ-ONLY — it can never place, modify or cancel an order. Covers orders placed through the TWS API by any client id, including a client that has since disconnected; orders placed manually in TWS are not covered. A failed read is an error, never an empty list.")]
+    async fn get_open_orders(
+        &self,
+        Parameters(params): Parameters<GetOpenOrdersParams>,
+    ) -> String {
+        if let Some(refusal) = self.gate.refusal_for("get_open_orders", params.account_id.as_deref()) {
+            return error_json(refusal);
+        }
+        let account_id = params.account_id.as_deref().unwrap_or("");
+        let symbol = params.symbol.as_deref().unwrap_or("");
+
+        match self.orders.open_orders(account_id, symbol).await {
+            Ok(read) => serde_json::to_string_pretty(&read.as_payload()).unwrap_or_default(),
+            Err(e) => error_json(e.to_string()),
+        }
+    }
 }
 
 fn default_mkt() -> String {
@@ -1013,6 +1072,17 @@ pub struct GetExecutionsParams {
     #[schemars(description = "Time filter — returns executions since this time. Format: YYYYMMDD (e.g. \"20260521\") or YYYYMMDD-HH:MM:SS in UTC (e.g. \"20260521-15:30:00\"). Optional.")]
     #[serde(default)]
     pub since: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GetOpenOrdersParams {
+    #[schemars(description = "Account ID. Optional — returns open orders for all accounts if omitted.")]
+    #[serde(default)]
+    pub account_id: Option<String>,
+
+    #[schemars(description = "Symbol filter, e.g. AAPL. Optional — returns all symbols if omitted.")]
+    #[serde(default)]
+    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1189,4 +1259,45 @@ pub struct QuoteResult {
     pub implied_volatility: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parity pin for the tool surface (`ibkr-mcp-py/docs/DEVIATIONS.md`
+    /// §D4): the captured fourteen plus `get_open_orders`, in the order the
+    /// server actually emits (rmcp lists alphabetically — the order recorded in
+    /// the `rust_paper/tools_list.json` capture, the PARITY §1 schema source).
+    /// The list a client sees must not drift silently.
+    #[test]
+    fn the_tool_surface_is_the_captured_fourteen_plus_get_open_orders() {
+        let names: Vec<String> = IbkrMcpServer::default()
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "get_account_info",
+                "get_bulk_quotes",
+                "get_connection_status",
+                "get_events",
+                "get_executions",
+                "get_historical_data",
+                "get_historical_ticks",
+                "get_iv_rank",
+                "get_market_data",
+                "get_open_orders",
+                "get_option_chain",
+                "get_option_quote",
+                "get_positions",
+                "run_scanner",
+                "what_if",
+            ],
+            "the tool list is the captured fourteen plus get_open_orders"
+        );
+    }
 }

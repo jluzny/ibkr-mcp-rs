@@ -21,8 +21,8 @@
 # owns each installed unit"): ibkr-stack no longer ships or installs a copy.
 
 [Unit]
-Description=IBKR MCP Server (native WSL2)
-After=ib-gateway-live.service
+Description=IBKR MCP Server (live-bound)
+After=ibgw-ibc@live.service
 
 # Bound restarts: at most 5 starts per 5 minutes. The canary no longer exits on
 # an unreachable broker, so reaching this limit means a genuinely broken process
@@ -39,7 +39,7 @@ ExecStart=/usr/local/bin/ibkr-mcp-rs
 Environment=IBKR_MCP_MCP__HOST=127.0.0.1
 Environment=IBKR_MCP_MCP__PORT=8881
 Environment=IBKR_MCP_IBKR__HOST=127.0.0.1
-Environment=IBKR_MCP_IBKR__PORT=4003
+Environment=IBKR_MCP_IBKR__PORT=4001
 Environment=IBKR_MCP_IBKR__CLIENT_ID=204
 Environment=IBKR_MCP_IBKR__PAPER_TRADING=false
 Environment=IBKR_MCP_IBKR__READ_ONLY=false

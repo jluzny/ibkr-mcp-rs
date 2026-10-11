@@ -9,14 +9,14 @@ use ibkr_mcp_rs::mcp::server::start_http_on_with_config;
 use rmcp::transport::StreamableHttpServerConfig;
 
 /// Live E2E test against a running IB Gateway.
-/// Requires IB Gateway or TWS to be running on localhost:4003 (live trading).
+/// Requires IB Gateway or TWS to be running on localhost:4001 (live trading).
 /// Run with: cargo test --test live_ibkr_test -- --ignored
 
 #[tokio::test]
-#[ignore = "Requires live IB Gateway on localhost:4003"]
+#[ignore = "Requires live IB Gateway on localhost:4001"]
 async fn test_live_market_data_quote() {
     let mut config = Config::default();
-    config.ibkr.port = 4003;
+    config.ibkr.port = 4001;
     config.ibkr.paper_trading = false;
     let client = IbkrClient::new(config.ibkr.clone());
     client.clone().connect();
@@ -65,11 +65,12 @@ async fn test_live_market_data_quote() {
 }
 
 #[tokio::test]
-#[ignore = "Requires live IB Gateway on localhost:4003"]
+#[ignore = "Requires live IB Gateway on localhost:4001"]
 async fn test_live_mcp_server_with_ibkr() {
     let mut config = Config::default();
-    config.ibkr.port = 4003;
+    config.ibkr.port = 4001;
     config.ibkr.paper_trading = false;
+    let config = Arc::new(config);
     let client = IbkrClient::new(config.ibkr.clone());
     client.clone().connect();
 
@@ -93,7 +94,7 @@ async fn test_live_mcp_server_with_ibkr() {
             .with_stateful_mode(false)
             .with_json_response(true)
             .with_cancellation_token(ct_clone.child_token());
-        let _ = start_http_on_with_config(listener, client, http_config, ct_clone).await;
+        let _ = start_http_on_with_config(listener, client, config, http_config, ct_clone).await;
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;

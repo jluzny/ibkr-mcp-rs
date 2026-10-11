@@ -8,7 +8,7 @@ description = "Interactive Brokers MCP Server in Rust"
 license = "MIT"
 
 [dependencies]
-ibapi = { git = "https://github.com/wboayue/rust-ibapi", branch = "main" }
+ibapi = { git = "https://github.com/wboayue/rust-ibapi", tag = "v5.0.0" }
 rmcp = { version = "2.1", features = [
     "server",
     "macros",

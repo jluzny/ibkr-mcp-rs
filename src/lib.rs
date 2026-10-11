@@ -19,14 +19,15 @@
 //! use ibkr_mcp_rs::config::Config;
 //! use ibkr_mcp_rs::ibkr::client::IbkrClient;
 //! use ibkr_mcp_rs::mcp::server::start_http;
+//! use std::sync::Arc;
 //! use tokio_util::sync::CancellationToken;
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let config = Config::load()?;
+//! let config = Arc::new(Config::load()?);
 //! let client = IbkrClient::new(config.ibkr.clone());
 //! client.clone().connect();
 //! let ct = CancellationToken::new();
-//! start_http(client, config.mcp, ct).await?;
+//! start_http(client, config, ct).await?;
 //! # Ok(()) }
 //! ```
 
@@ -35,3 +36,4 @@ pub mod ibkr;
 pub mod logging;
 pub mod mcp;
 pub mod persistence;
+pub mod policy;

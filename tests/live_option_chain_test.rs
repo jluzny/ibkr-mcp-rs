@@ -6,12 +6,12 @@ use ibkr_mcp_rs::ibkr::client::IbkrClient;
 use ibkr_mcp_rs::ibkr::market_data::MarketDataManager;
 
 /// Shared helper: connect to IB Gateway and return an Arc<IbkrClient>.
-/// Reads IBKR_PORT env var (default 4003 for live, 4004 for paper).
+/// Reads IBKR_PORT env var (default 4001 for live, 4002 for paper).
 async fn connect_to_ibkr() -> Arc<IbkrClient> {
     let port: u16 = std::env::var("IBKR_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4003);
+        .unwrap_or(4001);
 
     let mut config = Config::default();
     config.ibkr.port = port;

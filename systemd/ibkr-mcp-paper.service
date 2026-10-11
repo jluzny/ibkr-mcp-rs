@@ -1,0 +1,90 @@
+# /etc/systemd/system/ibkr-mcp-paper.service
+#
+# PAPER-BOUND instance of the same qualified MCP binary as the live-bound bridge.
+# Install with
+#   sudo bash scripts/install-mcp-tuple.sh --mode=unit
+# (the ONE owning installer for the ibkr-mcp tuple; see scripts/install-mcp-tuple.sh).
+#
+# WHY THIS UNIT EXISTS: the paper cycle observer must classify paper sessions
+# from a real health contract without reading live data. The live bridge binds
+# 8881 -> 4001 (ibgw-ibc@live), so reading it from a paper observer would be a
+# live/paper crossover. This instance binds the SAME binary to the paper lane:
+# 8882 -> 4002 (ibgw-ibc@paper).
+#
+# Relationship to the Gateway: After= ONLY - no Requires=, no Wants=, exactly
+# like the hardened live unit (and exactly what check-mcp-policy.sh enforces).
+# Wants= would still ACTIVATE the paper Gateway when the bridge starts, which is
+# the "MCP initiates Gateway authentication" failure mode (plan F7), and the
+# paper start broker must stay the only thing that may start paper (plan
+# 9.5/9.7). Ordering alone pulls nothing into the transaction. The bridge is
+# useful without the Gateway: it stays up and answers "broker not connected".
+#
+# It carries no [Install] dependency on a gateway unit either: enabling the
+# bridge must never enable the paper Gateway.
+#
+# INSTANCE ISOLATION (live must stay byte-identical, and paper evidence must
+# never be able to read live data):
+#   * separate HTTP endpoint (127.0.0.1:8882) - 8881 is untouched;
+#   * separate broker socket (127.0.0.1:4002, the paper lane's raw API port) -
+#     4001 is untouched;
+#   * separate IBKR client id (205). Client ids are scoped per Gateway instance,
+#     so 204 on paper would not literally collide with the live instance's 204 -
+#     but 205 makes the per-instance identity unambiguous in evidence and
+#     removes any possibility of disturbing the live client-id namespace. It is
+#     declared as client_id_migration_ref in the paper tuple manifest.
+#   * separate persistence/heartbeat paths. The binary's default is
+#     /var/lib/ibkr-mcp/last-good.json, else /tmp/ibkr-mcp-last-good.json - and
+#     the live instance currently writes /tmp/ibkr-mcp-last-good.json (mode
+#     0644), which a second instance started as the same user WOULD read at
+#     startup. The paper instance therefore pins both paths into its own state
+#     directory (/var/lib/ibkr-mcp-paper, owned by jiri, mode 0750). Sharing the
+#     live snapshot would have served LIVE account data out of the paper
+#     endpoint - the exact live/paper crossover this instance exists to avoid.
+#
+# Restart policy is identical to the live unit (bounded, 30 s): a fast cadence
+# amplified the Gateway's client_id handshake storm during 2FA.
+#
+# This file is the ONE source of truth for this unit (plan 13, "one repository
+# owns each installed unit"). It lives in the MCP repo's systemd/ directory;
+# the qualified tuple manifest is re-captured around it at install time
+# (snapshot_tree_sha256 is taken fresh in scripts/install-mcp-tuple.sh).
+
+[Unit]
+Description=IBKR MCP Server (paper-bound)
+After=ibgw-ibc@paper.service
+
+# Bound restarts: at most 5 starts per 5 minutes, same as the live unit.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jiri
+Group=jiri
+WorkingDirectory=/home/jiri/dev/trading/ibkr-mcp-rs
+ExecStart=/usr/local/bin/ibkr-mcp-rs
+Environment=IBKR_MCP_MCP__HOST=127.0.0.1
+Environment=IBKR_MCP_MCP__PORT=8882
+Environment=IBKR_MCP_IBKR__HOST=127.0.0.1
+Environment=IBKR_MCP_IBKR__PORT=4002
+Environment=IBKR_MCP_IBKR__CLIENT_ID=205
+Environment=IBKR_MCP_IBKR__PAPER_TRADING=true
+Environment=IBKR_MCP_IBKR__READ_ONLY=false
+# Health/tool-authorization contract version (plan 6.1). Part of the tuple: it
+# must equal health.contract_version in config/default.yaml, just as the live
+# unit does, and the process reports it on /version, /health/live and
+# /health/ready as `contractVersion`.
+Environment=IBKR_MCP_HEALTH__CONTRACT_VERSION=legacy-v0
+# Per-instance state. See INSTANCE ISOLATION above.
+Environment=IBKR_MCP_PERSIST_PATH=/var/lib/ibkr-mcp-paper/last-good.json
+Environment=IBKR_MCP_HEARTBEAT_PATH=/var/lib/ibkr-mcp-paper/heartbeat
+
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ibkr-mcp-paper
+
+[Install]
+WantedBy=multi-user.target

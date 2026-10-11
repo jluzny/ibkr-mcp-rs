@@ -41,7 +41,7 @@ graph LR
 | `get_market_data` | `symbol` (string), `data_type` (`"quote"`, `"historical"`, `"option_chain"`), `period`, `expiration` | Quote JSON with bid/ask/last/volume/high/low/close/source |
 | `get_account_info` | `account_id` (optional) | Account summary: netLiquidation, availableFunds, buyingPower, dailyPnL |
 | `get_positions` | `account_id` (optional) | Array of positions: symbol, quantity, averageCost, marketPrice, marketValue, unrealizedPnL, dailyPnL |
-| `get_connection_status` | none | `brokerConnected: true/false` + timestamp |
+| `get_connection_status` | none | `brokerConnected: true/false`, `consecutiveFailures`, `outageSeconds`, `message`, timestamp |
 
 ### Quote Source Fallback
 
@@ -116,10 +116,41 @@ When running in HTTP mode:
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health/live` | Server process is running |
-| `GET /health/ready` | Server ready to accept MCP connections |
-| `GET /health/broker` | IBKR gateway connection status |
+| `GET /health/live` | Server process is running — `200` even while the broker is down |
+| `GET /health/ready` | Server ready to accept MCP connections (`503` when the broker is down) |
+| `GET /health/broker` | Broker status: `brokerConnected`, `consecutiveFailures`, `outageSeconds` |
+| `GET /health/last-good` | Last persisted account snapshot with `ageSecs` |
 | `GET /version` | Server version (`ibkr-mcp-rs 0.1.0`) |
+
+## Broker outage policy
+
+**An unreachable broker is not a process fault.** While the gateway is down or
+awaiting a human 2FA approval the bridge stays up and keeps serving MCP: tools
+answer "not connected to IBKR" promptly, `/health/live` stays `200`, and
+reconnection is retried forever with a bounded backoff (60 s ceiling, then flat
+300 s once the outage is clearly not transient). The process only exits for a
+genuinely wedged *process* — its own HTTP server failing to answer
+`/health/live` three ticks in a row.
+
+Full policy, the failure-class table, backoff schedule, consumer-visible
+behaviour, systemd restart limits and the dead-port verification recipe:
+[`docs/broker-outage-policy.md`](docs/broker-outage-policy.md).
+
+Unit-side hardening lives in `systemd/` and is installed by the one owning
+installer, `scripts/install-mcp-tuple.sh` (gateway coupling: `Requires=` and
+`Wants=` removed, `After=` ordering only; `StartLimitBurst=5` per 300 s,
+`RestartSec=30`). It is the only thing allowed to put this tuple on the host:
+
+```bash
+bash scripts/install-mcp-tuple.sh --mode=snapshot-rollback   # pre-install rollback package
+bash scripts/install-mcp-tuple.sh --mode=manifest > /tmp/tuple.properties
+bash ../ibkr-stack/scripts/check-mcp-policy.sh --manifest /tmp/tuple.properties --installed
+sudo bash scripts/install-mcp-tuple.sh --mode=install --manifest /tmp/tuple.properties
+bash scripts/install-mcp-tuple.sh --mode=verify --manifest /tmp/tuple.properties
+```
+
+It never starts, stops or restarts a service: an MCP restart is a separate,
+explicitly approved MCP-only action (see `docs/broker-outage-policy.md`).
 
 ## Testing
 
@@ -130,7 +161,7 @@ cargo test
 # MCP server integration tests (random ephemeral port)
 cargo test --test mcp_server_test
 
-# Live E2E against a running IB Gateway (requires localhost:4003)
+# Live E2E against a running IB Gateway (requires localhost:4001)
 cargo test --test live_ibkr_test -- --ignored
 ```
 

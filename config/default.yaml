@@ -3,7 +3,7 @@
 # IBKR connection settings
 ibkr:
   host: "127.0.0.1"
-  port: 4003        # Gateway live trading
+  port: 4001        # ibgw-ibc@live raw API port (the 4003 socat front is retired)
   client_id: 100    # Unique client ID for this MCP server
   paper_trading: false
   read_only: true
@@ -15,7 +15,7 @@ ibkr:
 mcp:
   host: "0.0.0.0"
   port: 8881
-  session_timeout_secs: 0   # 0 = never auto-close
+  session_timeout_secs: 0   # 0/unset = rmcp's 300s idle reaper; N = idle lifetime seconds (DEVIATIONS D5 row 5)
 
 # Market data caching
 market_data:

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use ibkr_mcp_rs::config::{Config, McpConfig};
+use ibkr_mcp_rs::config::Config;
 use ibkr_mcp_rs::ibkr::client::IbkrClient;
 use ibkr_mcp_rs::mcp::server::start_http_on_with_config;
 use rmcp::transport::StreamableHttpServerConfig;
@@ -9,7 +9,7 @@ use rmcp::transport::StreamableHttpServerConfig;
 /// Start the MCP server on a random ephemeral port for testing.
 async fn start_test_server() -> (String, CancellationToken) {
     let ct = CancellationToken::new();
-    let config = Config::default();
+    let config = Arc::new(Config::default());
     let client = IbkrClient::new(config.ibkr.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -23,7 +23,7 @@ async fn start_test_server() -> (String, CancellationToken) {
 
     let ct_clone = ct.clone();
     tokio::spawn(async move {
-        let _ = start_http_on_with_config(listener, client, http_config, ct_clone).await;
+        let _ = start_http_on_with_config(listener, client, config, http_config, ct_clone).await;
     });
 
     // Give server time to start

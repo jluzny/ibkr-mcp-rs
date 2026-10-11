@@ -86,7 +86,7 @@ DROPIN_SRC=$REPO_ROOT/systemd/$UNIT_NAME.d/10-restart-policy.conf
 ROLLBACK_DIR_DEFAULT=$REPO_ROOT/backups/mcp-phase1
 FORWARD_DIR_DEFAULT=$REPO_ROOT/backups/mcp-phase1-forward
 HEALTH_URL_DEFAULT=http://127.0.0.1:8881/health/live
-GATEWAY_UNITS="ib-gateway-live.service ib-gateway-paper.service"
+GATEWAY_UNITS="ibgw-ibc@live.service ibgw-ibc@paper.service"
 
 MODE=check
 MANIFEST=${MANIFEST:-}
@@ -237,7 +237,7 @@ verify_manifest_against_host() {
   local unit
   unit="$(manifest_value unit_path)"
   if [ -f "$unit" ]; then
-    if grep -nE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*gateway' "$unit"; then
+    if grep -nE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*(gateway|ibgw-ibc)' "$unit"; then
       bad "unit declares a Gateway ACTIVATION edge - refusing (plan §6.1)"
     else
       ok "unit has no Gateway activation edge (Requires=/Wants=/...)"
@@ -362,7 +362,7 @@ mode_snapshot_rollback() {
   # Say what is actually true of THIS package: the park rationale is about the
   # activation edge, and a package whose unit has none (a redeployment after the
   # edge was removed) must not be described as if it had one.
-  if grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*gateway' "$cur_unit"; then
+  if grep -qE '^[[:space:]]*(Requires|Wants|BindsTo|PartOf|Requisite|Upholds)[[:space:]]*=.*(gateway|ibgw-ibc)' "$cur_unit"; then
     say "This is the tuple being REPLACED. Its unit CARRIES the Gateway activation"
     say "edge, so rollback_mode=park applies: a rollback restores its binary/config"
     say "only, never the unit."
@@ -421,7 +421,7 @@ mode_install() {
 
   step "effective systemd graph (plan §6.1: no Gateway activation edge)"
   systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -q 'gateway'; then
+  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph still activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"
@@ -446,7 +446,7 @@ mode_unit() {
   mv -f "/etc/systemd/system/.$UNIT_NAME.new" "$UNIT_DEST"
   systemctl daemon-reload
   systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -q 'gateway'; then
+  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph still activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"
@@ -491,7 +491,7 @@ mode_verify() {
 
   step "effective systemd graph"
   systemctl show "$UNIT_NAME" -p Requires -p Wants -p After -p FragmentPath -p DropInPaths -p ExecMainStartTimestamp -p InvocationID -p NRestarts
-  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -q 'gateway'; then
+  if systemctl show "$UNIT_NAME" -p Requires -p Wants | grep -qE 'gateway|ibgw-ibc'; then
     bad "EFFECTIVE graph activates a Gateway unit"
   else
     ok "effective Requires=/Wants= carry no Gateway unit"

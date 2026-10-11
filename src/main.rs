@@ -22,7 +22,7 @@ const EXIT_SERVER_FAILED: i32 = 1;
 async fn main() -> anyhow::Result<()> {
     let use_stdio = std::env::args().any(|a| a == "--stdio");
 
-    let config = Config::load()?;
+    let config = Arc::new(Config::load()?);
     logging::init_tracing(&config.logging.level, &config.logging.format);
 
     // The health/tool-authorization contract version is a member of the
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     if use_stdio {
         // Stdio mode: serve directly over stdin/stdout
-        if let Err(e) = start_stdio(Arc::clone(&client)).await {
+        if let Err(e) = start_stdio(Arc::clone(&client), Arc::clone(&config)).await {
             // Same rule as HTTP mode: a server that FAILED must never look
             // like a deliberate stop (defect F3).
             tracing::error!("MCP stdio server error: {}", e);
@@ -88,8 +88,9 @@ async fn main() -> anyhow::Result<()> {
         let server_handle = {
             let ct = ct.clone();
             let client = Arc::clone(&client);
+            let config = Arc::clone(&config);
             tokio::spawn(async move {
-                let res = start_http_on(listener, client, ct).await;
+                let res = start_http_on(listener, client, config, ct).await;
                 if let Err(e) = &res {
                     tracing::error!("MCP HTTP server error: {}", e);
                 }

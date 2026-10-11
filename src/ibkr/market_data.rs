@@ -383,8 +383,8 @@ impl MarketDataManager {
     /// Get option chain for a symbol.
     ///
     /// Resolves the real underlying contract ID via `contract_details()` first,
-    /// then calls `option_chain` with `exchange=""` (all exchanges) and the
-    /// real conID. This fixes error [321] on symbols like INIO/XYZ where
+    /// then calls `option_chain` with the real conID and no exchange filter
+    /// (all exchanges). This fixes error [321] on symbols like INIO/XYZ where
     /// `con_id=0` + `exchange="SMART"` fails because TWS cannot auto-resolve
     /// certain tickers by symbol alone, and SMART is not a valid exchange for
     /// sec_def_opt_params (it's a routing directive).
@@ -400,9 +400,12 @@ impl MarketDataManager {
         let con_id = self.resolve_contract_id(&client, symbol).await?;
         info!(symbol = %symbol, con_id, "Resolved underlying contract ID");
 
-        // Step 2: Call option_chain with exchange="" (all exchanges) and real conID
+        // Step 2: Call option_chain with the real conID and no exchange filter
+        // (unset is omitted on the wire = all exchanges; the ibapi 4.0+ builder
+        // API takes symbol/security_type/con_id and an optional .exchange()).
         let subscription = client
-            .option_chain(symbol, "", SecurityType::Stock, con_id)
+            .option_chain(symbol, SecurityType::Stock, con_id)
+            .subscribe()
             .await
             .map_err(|e| IbkrError::Unknown(format!("option_chain request failed: {e}")))?;
 
