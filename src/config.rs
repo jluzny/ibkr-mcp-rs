@@ -25,6 +25,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub market_data: MarketDataConfig,
     pub logging: LoggingConfig,
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,35 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
+/// Health / tool-authorization contract version (PLAN-gateway-supervisor-refactor
+/// §6.1).
+///
+/// `legacy-v0` = the pre-existing tool-authorization semantics with no readiness
+/// lease; `lease-v1` is staged and qualified in Phase 2 and never acts as a
+/// fallback for a missing, expired or unknown lease.
+///
+/// The deployed tuple declares this value three times and all three must agree:
+/// `health.contract_version` here, `IBKR_MCP_HEALTH__CONTRACT_VERSION` in the
+/// systemd unit, and `health_contract_version` in the artifact manifest
+/// (`ibkr-stack/scripts/check-mcp-policy.sh` fails the tuple on a mismatch). The
+/// process reports the resolved value on `/version`, `/health/live` and
+/// `/health/ready` as `contractVersion`.
+///
+/// The serde default exists only so that dev runs, the fault-matrix scratch
+/// instances and library users that pass no config file still start; a deployed
+/// config declares the value explicitly (the tuple gate rejects one that does
+/// not).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_contract_version")]
+    pub contract_version: String,
+}
+
+/// The staged Phase-1 contract version (see [`HealthConfig`]).
+pub fn default_contract_version() -> String {
+    "legacy-v0".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -88,6 +118,9 @@ impl Default for Config {
                 level: "info".to_string(),
                 format: "json".to_string(),
             },
+            health: HealthConfig {
+                contract_version: default_contract_version(),
+            },
         }
     }
 }
@@ -110,7 +143,7 @@ impl Config {
 
         figment = figment.merge(Env::prefixed("IBKR_MCP_").split("__"));
 
-        let config: Config = figment.extract()?;
+        let mut config: Config = figment.extract()?;
         Ok(config)
     }
 }
@@ -133,5 +166,20 @@ mod tests {
         assert_eq!(config.mcp.port, 8881);
         assert_eq!(config.ibkr.host, "127.0.0.1");
         assert_eq!(config.mcp.host, "0.0.0.0");
+    }
+
+    /// The contract version is a tuple member (PLAN §6.1): it resolves to the
+    /// staged `legacy-v0` whether it comes from `config/default.yaml` or from the
+    /// built-in default, and `Config::load()` succeeds with the deployed config —
+    /// a tuple that declares the wrong or no version is refused by the pre-install
+    /// gate, not silently defaulted at runtime.
+    #[test]
+    fn test_contract_version_resolves() {
+        let config = Config::default();
+        assert_eq!(config.health.contract_version, default_contract_version());
+        assert_eq!(config.health.contract_version, "legacy-v0");
+
+        let loaded = Config::load().expect("should load default config");
+        assert_eq!(loaded.health.contract_version, "legacy-v0");
     }
 }

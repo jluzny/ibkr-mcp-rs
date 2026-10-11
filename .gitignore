@@ -3,6 +3,9 @@
 
 # build/deploy artifacts — packaging/PKGBUILD is tracked source, its byproducts are not
 /dist/
+# the pre-install rollback package (plan §6.3 step 4) is an operational
+# artifact holding the previous binary/unit/config, not source
+/backups/
 /packaging/src/
 /packaging/pkg/
 /packaging/ibkr-mcp-rs/

@@ -46,6 +46,8 @@ async fn test_health_live() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["alive"], true);
+    // PLAN 6.1: the health surface carries the contract version explicitly.
+    assert_eq!(body["contractVersion"], "legacy-v0");
 }
 
 #[tokio::test]
@@ -64,6 +66,7 @@ async fn test_health_ready_broker_not_connected() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["brokerConnected"], false);
     assert_eq!(body["mcpServer"], true);
+    assert_eq!(body["contractVersion"], "legacy-v0");
 }
 
 #[tokio::test]
@@ -80,6 +83,7 @@ async fn test_version_endpoint() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["service"], "ibkr-mcp-rs");
+    assert_eq!(body["contractVersion"], "legacy-v0");
     assert!(body["version"].as_str().unwrap().len() > 0);
     assert_eq!(body["transport"], "streamable-http");
 }

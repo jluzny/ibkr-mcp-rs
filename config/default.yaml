@@ -27,3 +27,15 @@ market_data:
 logging:
   level: "info"
   format: "json"
+
+# Health / tool-authorization contract version (PLAN-gateway-supervisor-refactor
+# 6.1). Explicit, never inferred: the deployed tuple declares this value in three
+# places that must agree - here, IBKR_MCP_HEALTH__CONTRACT_VERSION in
+# systemd/ibkr-mcp.service, and health_contract_version in the artifact manifest.
+# ibkr-stack/scripts/check-mcp-policy.sh fails the tuple on a mismatch, and the
+# running process reports it on /version, /health/live and /health/ready as
+# `contractVersion`.
+#   legacy-v0 = pre-existing tool-authorization semantics, no readiness lease
+#   lease-v1  = staged in Phase 2; never a fallback for a missing/expired lease
+health:
+  contract_version: "legacy-v0"

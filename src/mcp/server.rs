@@ -20,7 +20,6 @@ use crate::ibkr::market_data::MarketDataManager;
 use crate::ibkr::orders::OrderManager;
 use crate::ibkr::scanner::ScannerManager;
 use crate::mcp::tools::IbkrMcpServer;
-
 use rmcp::ServiceExt;
 
 /// Start the MCP stdio server
@@ -34,16 +33,27 @@ pub async fn start_stdio(
     Ok(())
 }
 
+/// Bind the MCP HTTP listener for `config`.
+///
+/// Split out of [`start_http`] so the process entry point can bind *before*
+/// spawning the server task: a listener that cannot bind must reach a non-zero
+/// exit, not a log line followed by a clean `exit 0` (defect F3, fault-matrix
+/// case M4).
+pub async fn bind_http(config: &McpConfig) -> anyhow::Result<tokio::net::TcpListener> {
+    let addr = format!("{}:{}", config.host, config.port);
+    info!(addr = %addr, "Starting MCP HTTP server");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    Ok(listener)
+}
+
 /// Start the MCP HTTP server on the configured address
 pub async fn start_http(
     client: Arc<crate::ibkr::client::IbkrClient>,
     config: McpConfig,
     ct: CancellationToken,
 ) -> anyhow::Result<()> {
-    let addr = format!("{}:{}", config.host, config.port);
-    info!(addr = %addr, "Starting MCP HTTP server");
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = bind_http(&config).await?;
     start_http_on(listener, client, ct).await
 }
 
@@ -85,7 +95,6 @@ pub async fn start_http_on_with_config(
     let history = Arc::new(HistoricalDataManager::new(Arc::clone(&client)));
     let scanner = Arc::new(ScannerManager::new(Arc::clone(&client)));
     let events = Arc::new(EventManager::new(Arc::clone(&client)));
-
     let service: StreamableHttpService<IbkrMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {

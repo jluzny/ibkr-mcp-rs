@@ -1,0 +1,63 @@
+# /etc/systemd/system/ibkr-mcp.service
+#
+# Hardened restart policy for the IBKR MCP bridge. Install with
+#   sudo bash scripts/install-mcp-tuple.sh --mode=unit
+# (or, for the whole qualified tuple, --mode=install).
+# Reasoning and failure-class table: docs/broker-outage-policy.md.
+#
+# Why the gateway relationship is After= ONLY - no Requires=, no Wants=:
+# Wants= is a weaker dependency than Requires=, but it still ACTIVATES the
+# gateway when the bridge starts, which is exactly "MCP initiates Gateway
+# authentication" (plan F7: both had to go). After= alone only orders the two
+# units - it pulls nothing into the transaction. The bridge does not need the
+# gateway up to be useful: it needs it eventually, and until then it stays up
+# and answers "broker not connected".
+#
+# A drop-in cannot make this change: verified on systemd 261, an empty
+# `Requires=` / `After=` assignment in a .d/*.conf does NOT remove a dependency
+# declared in the main unit file. Only editing this file does.
+#
+# This file is the ONE source of truth for this unit (plan 13, "one repository
+# owns each installed unit"): ibkr-stack no longer ships or installs a copy.
+
+[Unit]
+Description=IBKR MCP Server (native WSL2)
+After=ib-gateway-live.service
+
+# Bound restarts: at most 5 starts per 5 minutes. The canary no longer exits on
+# an unreachable broker, so reaching this limit means a genuinely broken process
+# and a human should look at it.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jiri
+Group=jiri
+WorkingDirectory=/home/jiri/dev/trading/ibkr-mcp-rs
+ExecStart=/usr/local/bin/ibkr-mcp-rs
+Environment=IBKR_MCP_MCP__HOST=127.0.0.1
+Environment=IBKR_MCP_MCP__PORT=8881
+Environment=IBKR_MCP_IBKR__HOST=127.0.0.1
+Environment=IBKR_MCP_IBKR__PORT=4003
+Environment=IBKR_MCP_IBKR__CLIENT_ID=204
+Environment=IBKR_MCP_IBKR__PAPER_TRADING=false
+Environment=IBKR_MCP_IBKR__READ_ONLY=false
+# Health/tool-authorization contract version (plan 6.1). Part of the qualified
+# tuple: it must equal health.contract_version in config/default.yaml and
+# health_contract_version in the artifact manifest, and the process reports it
+# on /version, /health/live and /health/ready as `contractVersion`.
+# check-mcp-policy.sh fails the tuple if the three disagree.
+Environment=IBKR_MCP_HEALTH__CONTRACT_VERSION=legacy-v0
+
+# Restarts are exceptional now (see above) - no reason to come back within 5s,
+# and that 5s cadence amplified the gateway's handshake storm during 2FA.
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ibkr-mcp
+
+[Install]
+WantedBy=multi-user.target
