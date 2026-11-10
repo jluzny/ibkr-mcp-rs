@@ -10,7 +10,7 @@
 
 **ExecutionFilter fields:**
 - `client_id: i32` — filter by client ID (0 = all)
-- `account_code: String` — filter by account (e.g. "U18197748")
+- `account_code: String` — filter by account (e.g. "U00000000")
 - `time: String` — filter by time (format: "YYYYMMDD-HH:MM:SS")
 - `symbol: String` — filter by symbol
 - `security_type: SecurityType` — filter by type

@@ -5,7 +5,7 @@ use ibkr_mcp_rs::ibkr::account::Position;
 #[test]
 fn position_json_includes_option_fields() {
     let pos = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "BTDR".into(),
         quantity: -2.0,
         average_cost: 476.30,
@@ -47,7 +47,7 @@ fn position_json_includes_option_fields() {
 #[test]
 fn position_json_stock_has_null_option_fields() {
     let pos = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "SOFI".into(),
         quantity: 700.0,
         average_cost: 25.21,
@@ -89,7 +89,7 @@ fn position_json_stock_has_null_option_fields() {
 #[test]
 fn position_json_put_option_round_trip() {
     let pos = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "XXI".into(),
         quantity: -1.0,
         average_cost: 848.75,
@@ -130,7 +130,7 @@ fn position_json_put_option_round_trip() {
 #[test]
 fn position_json_includes_contract_id() {
     let pos = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "AAPL".into(),
         quantity: 100.0,
         average_cost: 150.25,

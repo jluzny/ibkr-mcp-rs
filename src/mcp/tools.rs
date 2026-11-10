@@ -75,7 +75,12 @@ impl IbkrMcpServer {
             Arc::clone(&client),
             config.market_data.clone(),
         ));
-        let account = Arc::new(AccountManager::new(Arc::clone(&client)));
+        let account = Arc::new(
+            AccountManager::new(Arc::clone(&client))
+                .with_refresh_interval(std::time::Duration::from_secs(
+                    config.ibkr.account_refresh_secs,
+                )),
+        );
         let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
         let history = Arc::new(HistoricalDataManager::new(Arc::clone(&client)));
         let scanner = Arc::new(ScannerManager::new(Arc::clone(&client)));
@@ -334,27 +339,104 @@ impl IbkrMcpServer {
         }
         let account_id = params.account_id.as_deref();
 
-        match self.account.get_account_info(account_id).await {
-            Ok(info) => {
-                serde_json::to_string_pretty(
-                    &serde_json::json!({
-                        "success": true,
-                        "accountId": info.account_id,
-                        "netLiquidation": info.net_liquidation,
-                        "availableFunds": info.available_funds,
-                        "excessLiquidity": info.excess_liquidity,
-                        "buyingPower": info.buying_power,
-                        "currency": info.currency,
-                        "dailyPnL": info.daily_pnl,
-                    })
-                )
-                .unwrap_or_default()
+        match self.account.get_account_info_read(account_id).await {
+            Ok(read) => {
+                let info = &read.info;
+
+                // Account identity: the bridge keeps ONE "All" subscription, so
+                // it cannot filter per account. It attests only what is true:
+                // the returned label equals the requested id (the single-account
+                // deployment honoured the request). A disagreement fails closed
+                // — no echo, no `account_bound` — because vouching for a binding
+                // the bridge cannot enforce is exactly the ACCOUNT_UNVERIFIED
+                // failure this key exists to prevent.
+                if let Some(requested) = account_id {
+                    if requested.is_empty()
+                        || info.account_id.is_empty()
+                        || requested != info.account_id
+                    {
+                        return serde_json::to_string_pretty(&serde_json::json!({
+                            "success": false,
+                            "error": format!(
+                                "account_id mismatch: requested {requested:?}, broker returned {:?}; refusing to attest the binding",
+                                info.account_id
+                            ),
+                        }))
+                        .unwrap_or_default();
+                    }
+                }
+
+                // Per-tag values plus the tables that let a consumer prove, per
+                // field, whether IBKR carried it and when it was last received.
+                // Absent tags stay `null` — they are never coerced to `0.0`.
+                let mut values = serde_json::Map::new();
+                let mut presence = serde_json::Map::new();
+                let mut receipts = serde_json::Map::new();
+                let mut currencies = serde_json::Map::new();
+                for (tag, field) in crate::ibkr::account::ACCOUNT_TAG_FIELDS {
+                    match read.tags.get(tag) {
+                        Some(tag_read) if tag_read.value.is_some() => {
+                            values.insert(field.to_string(), serde_json::json!(tag_read.value));
+                            presence.insert(field.to_string(), serde_json::json!(true));
+                            receipts.insert(field.to_string(), serde_json::json!(tag_read.received_at));
+                            if let Some(currency) = &tag_read.currency {
+                                currencies.insert(field.to_string(), serde_json::json!(currency));
+                            }
+                        }
+                        _ => {
+                            values.insert(field.to_string(), serde_json::Value::Null);
+                            presence.insert(field.to_string(), serde_json::json!(false));
+                        }
+                    }
+                }
+
+                let mut payload = serde_json::json!({
+                    "success": true,
+                    "accountId": info.account_id,
+                    "currency": info.currency,
+                    // Not carried by AccountSummary: unproven, not zero.
+                    "dailyPnL": serde_json::Value::Null,
+                    "account_bound": !info.account_id.is_empty(),
+                    // Completeness: `AccountSummaryEnd` covers the initial set only.
+                    "end": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                    "end_marker": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                    "terminal_sentinel": read.provenance.terminal_sentinel,
+                    "count": read.provenance.count,
+                    "generation": read.provenance.generation,
+                    "received_at": read.provenance.received_at,
+                    "presence": presence,
+                    "field_receipts": receipts,
+                    "tag_currency": currencies,
+                    // Slot health: a `[322]` (or an unconfirmed desubscribe)
+                    // parks the pump, so the receipts above can only age. The
+                    // real IBKR text is carried so a consumer never has to
+                    // guess why the snapshot stopped refreshing.
+                    "summary_slot_leaked": self.account.summary_slot_leaked(),
+                    "pump_error": self.account.summary_error(),
+                });
+                if let Some(object) = payload.as_object_mut() {
+                    object.extend(values);
+                    // Present only when the caller named the account and the
+                    // label matched: absent for an omitted account_id, and
+                    // never emitted on the mismatch path above.
+                    if let Some(requested) = account_id {
+                        object.insert(
+                            "requestedAccountId".to_string(),
+                            serde_json::json!(requested),
+                        );
+                    }
+                }
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
             }
             Err(e) => {
                 serde_json::to_string_pretty(
                     &serde_json::json!({
                         "success": false,
                         "error": e.to_string(),
+                        // The refusal text already quotes the pump error; this
+                        // key keeps it machine-readable.
+                        "pump_error": self.account.summary_error(),
+                        "summary_slot_leaked": self.account.summary_slot_leaked(),
                     })
                 )
                 .unwrap_or_default()
@@ -373,11 +455,21 @@ impl IbkrMcpServer {
         }
         let account_id = params.account_id.as_deref();
 
-        match self.account.get_positions(account_id).await {
-            Ok(positions) => {
+        match self.account.get_positions_read(account_id).await {
+            Ok(read) => {
+                let positions = &read.positions;
                 serde_json::to_string_pretty(
                     &serde_json::json!({
                         "success": true,
+                        // Completeness proof: true only if `PositionEnd` arrived.
+                        "end": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                        "end_marker": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                        "terminal_sentinel": read.provenance.terminal_sentinel,
+                        "count": read.provenance.count,
+                        "received_count": read.received_count,
+                        "marks_attested": read.marks_attested,
+                        "generation": read.provenance.generation,
+                        "received_at": read.provenance.received_at,
                         "positions": positions.iter().map(|p| serde_json::json!({
                             "symbol": p.symbol,
                             "quantity": p.quantity,
@@ -419,8 +511,9 @@ impl IbkrMcpServer {
         let symbol = params.symbol.as_deref();
         let since = params.since.as_deref();
 
-        match self.account.get_executions(account_id, symbol, since).await {
-            Ok(executions) => {
+        match self.account.get_executions_read(account_id, symbol, since).await {
+            Ok(read) => {
+                let executions = &read.executions;
                 let total_pnl: f64 = executions.iter().map(|e| e.realized_pnl).sum();
                 let total_commission: f64 = executions.iter().map(|e| e.commission).sum();
                 serde_json::to_string_pretty(
@@ -430,6 +523,13 @@ impl IbkrMcpServer {
                         "totalCommission": total_commission,
                         "netPnL": total_pnl - total_commission,
                         "count": executions.len(),
+                        // `collect_to_end_within` only returns Ok when `ExecutionDataEnd`
+                        // arrived; any timeout/close is an error above, never an empty ledger.
+                        "end": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                        "end_marker": read.provenance.end_marker.clone().unwrap_or_else(|| "none".to_string()),
+                        "terminal_sentinel": read.provenance.terminal_sentinel,
+                        "generation": read.provenance.generation,
+                        "received_at": read.provenance.received_at,
                         "executions": executions.iter().map(|e| serde_json::json!({
                             "executionId": e.execution_id,
                             "symbol": e.symbol,
@@ -1299,5 +1399,255 @@ mod tests {
             ],
             "the tool list is the captured fourteen plus get_open_orders"
         );
+    }
+
+    // ========================================================================
+    // Payload shape (design §2.2-2.4, §7.1-7.3): the fake gateway drives the
+    // real handlers, so these pin the JSON a client actually receives.
+    // ========================================================================
+
+    use crate::ibkr::account::gateway;
+    use crate::ibkr::account::gateway::{
+        spawn_gateway, ExecutionsScript, PositionsScript, Script, SummaryScript,
+    };
+
+    async fn server_for(script: Script) -> (IbkrMcpServer, gateway::Capture) {
+        let (port, capture) = spawn_gateway(script).await;
+        let (client, config) = gateway::connected_client_config(port).await;
+        (IbkrMcpServer::new(client, config), capture)
+    }
+
+    async fn account_payload(server: &IbkrMcpServer) -> serde_json::Value {
+        let raw = server
+            .get_account_info(Parameters(GetAccountInfoParams { account_id: None }))
+            .await;
+        serde_json::from_str(&raw).expect("the handler emits JSON")
+    }
+
+    /// Poll until the account payload proves the end marker. The pump caches
+    /// every NLV-bearing frame, so a call can legitimately see the dump in
+    /// flight; the assertions are about shape, not about sleep durations.
+    async fn complete_account_payload(server: &IbkrMcpServer) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let payload = account_payload(server).await;
+            if payload["end"] == "AccountSummaryEnd" {
+                return payload;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the account payload never proved AccountSummaryEnd: {payload}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn account_payload_carries_provenance() {
+        let (server, capture) = server_for(Script::summary(SummaryScript::Complete)).await;
+        let payload = complete_account_payload(&server).await;
+
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["end"], "AccountSummaryEnd");
+        assert_eq!(payload["end_marker"], "AccountSummaryEnd");
+        assert_eq!(payload["terminal_sentinel"], true);
+        assert_eq!(payload["count"], 9);
+        assert_eq!(payload["account_bound"], true);
+        assert_eq!(payload["currency"], "USD");
+        assert!(payload["generation"].is_u64());
+        assert!(payload["received_at"].as_str().unwrap().ends_with('Z'));
+
+        // The new keys, present and typed.
+        assert_eq!(payload["totalCashValue"], 75_000.00);
+        assert_eq!(payload["grossPositionValue"], 25_000.00);
+        assert_eq!(payload["equityWithLoanValue"], 100_000.50);
+        assert_eq!(payload["maintMarginReq"], 15_000.00);
+        assert_eq!(payload["initMarginReq"], 18_000.00);
+        assert_eq!(payload["presence"]["maintMarginReq"], true);
+        assert!(payload["field_receipts"]["maintMarginReq"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z'));
+        assert_eq!(payload["tag_currency"]["maintMarginReq"], "USD");
+        // Not carried by AccountSummary: unproven, never 0.
+        assert_eq!(payload["dailyPnL"], serde_json::Value::Null);
+        // LookAhead tags are subscribed but have no adapter field.
+        assert_eq!(payload["presence"]["lookAheadMaintMarginReq"], false);
+        assert_eq!(
+            payload["lookAheadMaintMarginReq"],
+            serde_json::Value::Null
+        );
+
+        let tags = capture.summary_tags().await;
+        for tag in ["MaintMarginReq", "InitMarginReq", "LookAheadMaintMarginReq", "LookAheadInitMarginReq"] {
+            assert!(tags.split(',').any(|t| t == tag), "{tag} missing from {tags}");
+        }
+    }
+
+    #[tokio::test]
+    async fn account_payload_absent_tag_is_null() {
+        let (server, _capture) =
+            server_for(Script::summary(SummaryScript::AbsentMaintMargin)).await;
+        let payload = complete_account_payload(&server).await;
+
+        assert_eq!(payload["maintMarginReq"], serde_json::Value::Null);
+        assert_eq!(payload["presence"]["maintMarginReq"], false);
+        assert!(payload["field_receipts"].get("maintMarginReq").is_none());
+        assert_eq!(payload["count"], 8);
+        // No fabricated zero anywhere.
+        assert_eq!(payload["netLiquidation"], 100_000.50);
+    }
+
+    async fn account_payload_for(
+        server: &IbkrMcpServer,
+        account_id: Option<&str>,
+    ) -> serde_json::Value {
+        let raw = server
+            .get_account_info(Parameters(GetAccountInfoParams {
+                account_id: account_id.map(str::to_string),
+            }))
+            .await;
+        serde_json::from_str(&raw).expect("the handler emits JSON")
+    }
+
+    /// Card A: `requestedAccountId` echoes the requested value only when the
+    /// caller named an account AND the broker's label matched it.
+    #[tokio::test]
+    async fn account_payload_echoes_the_requested_account_when_it_matches() {
+        let (server, _capture) = server_for(Script::summary(SummaryScript::Complete)).await;
+        let _ = complete_account_payload(&server).await;
+
+        let omitted = account_payload_for(&server, None).await;
+        assert_eq!(omitted["success"], true);
+        assert!(
+            omitted.get("requestedAccountId").is_none(),
+            "no echo without a request"
+        );
+
+        let matched = account_payload_for(&server, Some(gateway::ACCOUNT)).await;
+        assert_eq!(matched["success"], true);
+        assert_eq!(matched["requestedAccountId"], gateway::ACCOUNT);
+        assert_eq!(matched["accountId"], gateway::ACCOUNT);
+        assert_eq!(matched["account_bound"], true);
+        assert_eq!(matched["netLiquidation"], 100_000.50);
+    }
+
+    /// Card A: a disagreement between the requested account and the broker's
+    /// label fails closed — no echo, no `account_bound`, no vouched binding.
+    #[tokio::test]
+    async fn account_payload_fails_closed_on_a_mismatched_account() {
+        let (server, _capture) = server_for(Script::summary(SummaryScript::Complete)).await;
+        let _ = complete_account_payload(&server).await;
+
+        for requested in [gateway::OTHER_ACCOUNT, ""] {
+            let payload = account_payload_for(&server, Some(requested)).await;
+            assert_eq!(payload["success"], false, "requested {requested:?}");
+            let error = payload["error"].as_str().expect("an error string");
+            assert!(error.contains("mismatch"), "error = {error}");
+            for key in ["requestedAccountId", "accountId", "account_bound"] {
+                assert!(
+                    payload.get(key).is_none(),
+                    "{key} must not be emitted on the mismatch path"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn positions_payload_carries_provenance() {
+        let (server, _capture) = server_for(Script::positions(PositionsScript::EmptyEnd)).await;
+        let raw = server
+            .get_positions(Parameters(GetPositionsParams { account_id: None }))
+            .await;
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+
+        // The confirmed-empty book of §2.3, now with its completeness proof.
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["end"], "PositionEnd");
+        assert_eq!(payload["end_marker"], "PositionEnd");
+        assert_eq!(payload["terminal_sentinel"], true);
+        assert_eq!(payload["count"], 0);
+        assert_eq!(payload["received_count"], 0);
+        assert_eq!(payload["marks_attested"], false);
+        assert!(payload["generation"].is_u64());
+        assert!(payload["received_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(payload["positions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn positions_payload_rows_carry_marks() {
+        let (server, _capture) =
+            server_for(Script::positions_with_marks(PositionsScript::TwoRowsEnd)).await;
+        let raw = server
+            .get_positions(Parameters(GetPositionsParams { account_id: None }))
+            .await;
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["terminal_sentinel"], true);
+        assert_eq!(payload["count"], 2);
+        assert_eq!(payload["received_count"], 2);
+        assert_eq!(payload["marks_attested"], true);
+        let rows = payload["positions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["symbol"], "AAPL");
+        assert_eq!(rows[0]["quantity"], 100.0);
+        assert_eq!(rows[0]["marketValue"], 200.0);
+        assert_eq!(rows[0]["strike"], serde_json::Value::Null);
+        assert_eq!(rows[1]["symbol"], "IBIT");
+        assert_eq!(rows[1]["securityType"], "OPT");
+        assert_eq!(rows[1]["strike"], 45.0);
+        assert_eq!(rows[1]["right"], "P");
+        assert_eq!(rows[1]["expiration"], "20260522");
+        assert_eq!(rows[1]["multiplier"], "100");
+    }
+
+    #[tokio::test]
+    async fn executions_payload_empty_ledger() {
+        let (server, _capture) = server_for(Script::executions(ExecutionsScript::EmptyEnd)).await;
+        let raw = server
+            .get_executions(Parameters(GetExecutionsParams {
+                account_id: None,
+                symbol: None,
+                since: None,
+            }))
+            .await;
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+
+        // A marked empty ledger is a success — the case the old payload could
+        // not distinguish from a deadline.
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["count"], 0);
+        assert_eq!(payload["end"], "ExecutionDataEnd");
+        assert_eq!(payload["end_marker"], "ExecutionDataEnd");
+        assert_eq!(payload["terminal_sentinel"], true);
+        assert_eq!(payload["totalRealizedPnL"], 0.0);
+        assert_eq!(payload["totalCommission"], 0.0);
+        assert_eq!(payload["netPnL"], 0.0);
+        assert!(payload["received_at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(payload["executions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn executions_payload_close_is_error() {
+        let (server, _capture) =
+            server_for(Script::executions(ExecutionsScript::OneRowClose)).await;
+        let raw = server
+            .get_executions(Parameters(GetExecutionsParams {
+                account_id: None,
+                symbol: None,
+                since: None,
+            }))
+            .await;
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+
+        // A close without ExecutionDataEnd is a failed read, never an empty
+        // ledger and never a partial one.
+        assert_eq!(payload["success"], false);
+        assert!(payload.get("executions").is_none());
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("no ExecutionDataEnd marker"));
     }
 }

@@ -1,7 +1,7 @@
 # PLAN: Fix stale account-summary cache (get_account_info serves hours-old snapshot)
 
 **Date:** 2026-08-21
-**Task:** t_8eb962eb
+**Task:** fix stale account-summary cache
 **Status:** For Jiri's review — DO NOT implement yet
 
 ## Problem
@@ -248,8 +248,8 @@ No new files, no struct changes, no API changes. ~15 lines of diff.
 
 ### What NOT to test
 
-- `dailyPnL` — hardcoded 0.0, known gap, belongs to task t_1e63b08f
-- `get_positions` PnL fields — separate task t_2d76b9be
+- `dailyPnL` — hardcoded 0.0, known gap, tracked separately
+- `get_positions` PnL fields — tracked separately
 
 ## Deployment
 

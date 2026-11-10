@@ -1,4 +1,4 @@
-# Maintainer: Jiri Luzny <jiri@luzny.org>
+# Maintainer: Jiri <6214030+jluzny@users.noreply.github.com>
 # IBKR MCP Server — Rust MCP server for Interactive Brokers.
 #
 # Builds from SOURCE (cargo build --release --locked). The previous version just

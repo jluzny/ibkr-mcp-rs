@@ -56,6 +56,17 @@ pub struct IbkrConfig {
     pub connection_timeout_secs: u64,
     pub retry_attempts: u32,
     pub retry_delay_ms: u64,
+    /// Cadence (seconds) for re-requesting the account summary so per-tag
+    /// receipts stay fresh: IBKR does not resend unchanged values on a
+    /// long-lived subscription. The bridge cancels and re-opens exactly one
+    /// subscription at most once per this interval. `0` disables the refresh.
+    #[serde(default = "default_account_refresh_secs")]
+    pub account_refresh_secs: u64,
+}
+
+/// Default account-summary refresh cadence (`config/default.yaml`).
+pub fn default_account_refresh_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +131,7 @@ impl Default for Config {
                 connection_timeout_secs: 15,
                 retry_attempts: 100,
                 retry_delay_ms: 1000,
+                account_refresh_secs: default_account_refresh_secs(),
             },
             mcp: McpConfig {
                 host: "0.0.0.0".to_string(),

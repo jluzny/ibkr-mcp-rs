@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn position_stock_has_null_option_fields() {
         let pos = Position {
-            account_id: "U18197748".into(),
+            account_id: "U00000000".into(),
             symbol: "SOFI".into(),
             quantity: 700.0,
             average_cost: 25.21,
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn position_option_has_populated_fields() {
         let pos = Position {
-            account_id: "U18197748".into(),
+            account_id: "U00000000".into(),
             symbol: "IBIT".into(),
             quantity: -1.0,
             average_cost: 254.29,
@@ -335,7 +335,7 @@ async fn get_positions_json_includes_option_fields() {
     // Build a Position with option fields, serialize to JSON,
     // verify all new fields appear in output
     let position = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "BTDR".into(),
         quantity: -2.0,
         average_cost: 476.30,
@@ -363,7 +363,7 @@ async fn get_positions_json_includes_option_fields() {
 #[tokio::test]
 async fn get_positions_json_stock_has_null_option_fields() {
     let position = Position {
-        account_id: "U18197748".into(),
+        account_id: "U00000000".into(),
         symbol: "SOFI".into(),
         quantity: 700.0,
         average_cost: 25.21,

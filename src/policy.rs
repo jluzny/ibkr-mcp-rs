@@ -29,7 +29,7 @@ pub const ACCOUNT_SCOPED_TOOLS: &[&str] = &[
 ];
 
 /// IBKR's own paper-account convention, measured on the deployed pair: the
-/// paper account is `DU…` (`DUK271345` on 8882) vs live `U…` (`U18197748`).
+/// paper account is `DU…` (`DUK000000` on 8882) vs live `U…` (`U00000000`).
 pub const PAPER_ACCOUNT_PREFIX: &str = "DU";
 
 /// `true` for an IBKR paper account id (`DU…`).
@@ -102,7 +102,7 @@ mod tests {
     fn a_default_gate_refuses_nothing() {
         let g = OrderGate::default();
         for tool in ACCOUNT_SCOPED_TOOLS {
-            assert!(!g.refuses(tool, Some("U18197748")), "{tool} must stay open");
+            assert!(!g.refuses(tool, Some("U00000000")), "{tool} must stay open");
             assert!(!g.refuses(tool, None), "{tool} must stay open");
         }
     }
@@ -117,7 +117,7 @@ mod tests {
         );
         // The read tools are never refused by read_only.
         for tool in ["get_account_info", "get_positions", "get_executions", "get_open_orders"] {
-            assert!(!g.refuses(tool, Some("U18197748")), "{tool} must stay open");
+            assert!(!g.refuses(tool, Some("U00000000")), "{tool} must stay open");
         }
     }
 
@@ -126,19 +126,19 @@ mod tests {
         let g = gate(false, true);
         for tool in ACCOUNT_SCOPED_TOOLS {
             let refusal = g
-                .refusal_for(tool, Some("U18197748"))
+                .refusal_for(tool, Some("U00000000"))
                 .unwrap_or_else(|| panic!("{tool} must refuse a live account"));
             assert_eq!(
                 refusal,
                 format!(
-                    "refused: ibkr.paper_trading is set to true (explicitly configured) and account_id=U18197748 is not a paper account, so {tool} will not act on it"
+                    "refused: ibkr.paper_trading is set to true (explicitly configured) and account_id=U00000000 is not a paper account, so {tool} will not act on it"
                 )
             );
         }
         // Omitted account and the paper account keep working.
         for tool in ACCOUNT_SCOPED_TOOLS {
             assert!(!g.refuses(tool, None), "{tool} must accept an omitted account");
-            assert!(!g.refuses(tool, Some("DUK271345")), "{tool} must accept a paper account");
+            assert!(!g.refuses(tool, Some("DUK000000")), "{tool} must accept a paper account");
         }
     }
 
@@ -146,23 +146,23 @@ mod tests {
     fn paper_trading_never_refuses_a_non_scoped_tool() {
         let g = gate(false, true);
         for tool in ["get_market_data", "get_bulk_quotes", "run_scanner", "get_events"] {
-            assert!(!g.refuses(tool, Some("U18197748")), "{tool} is not account-scoped");
+            assert!(!g.refuses(tool, Some("U00000000")), "{tool} is not account-scoped");
         }
     }
 
     #[test]
     fn read_only_takes_precedence_over_the_account_refusal() {
         let g = gate(true, true);
-        let refusal = g.refusal_for("what_if", Some("U18197748")).unwrap();
+        let refusal = g.refusal_for("what_if", Some("U00000000")).unwrap();
         assert!(refusal.starts_with("refused: ibkr.read_only"), "{refusal}");
     }
 
     #[test]
     fn paper_account_matching_is_trimmed_and_case_insensitive() {
-        assert!(is_paper_account("DUK271345"));
-        assert!(is_paper_account("duk271345"));
-        assert!(is_paper_account("  DUK271345  "));
-        assert!(!is_paper_account("U18197748"));
+        assert!(is_paper_account("DUK000000"));
+        assert!(is_paper_account("duk000000"));
+        assert!(is_paper_account("  DUK000000  "));
+        assert!(!is_paper_account("U00000000"));
         assert!(!is_paper_account(""));
     }
 

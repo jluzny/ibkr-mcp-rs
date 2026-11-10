@@ -10,6 +10,11 @@ ibkr:
   connection_timeout_secs: 15
   retry_attempts: 100
   retry_delay_ms: 1000
+  # Re-request the account summary this often (seconds) so the per-tag
+  # receipts stay fresh: IBKR does not resend unchanged values on a
+  # long-lived subscription. The bridge cancels and re-opens exactly one
+  # subscription, at most once per interval. 0 disables the refresh.
+  account_refresh_secs: 60
 
 # MCP server settings
 mcp:

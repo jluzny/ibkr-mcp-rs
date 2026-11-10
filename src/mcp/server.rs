@@ -93,7 +93,12 @@ pub async fn start_http_on_with_config(
         Arc::clone(&client),
         config.market_data.clone(),
     ));
-    let account = Arc::new(AccountManager::new(Arc::clone(&client)));
+    let account = Arc::new(
+        AccountManager::new(Arc::clone(&client))
+            .with_refresh_interval(std::time::Duration::from_secs(
+                config.ibkr.account_refresh_secs,
+            )),
+    );
     let orders = Arc::new(OrderManager::new(Arc::clone(&client)));
     // Scanner holds a process-wide concurrency semaphore (IBKR allows 10
     // concurrent scans) — it must be shared across sessions, not per-session.

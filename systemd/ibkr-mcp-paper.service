@@ -61,7 +61,7 @@ StartLimitBurst=5
 Type=simple
 User=jiri
 Group=jiri
-WorkingDirectory=/home/jiri/dev/trading/ibkr-mcp-rs
+WorkingDirectory=/home/ibkr/ibkr-mcp-rs
 ExecStart=/usr/local/bin/ibkr-mcp-rs
 Environment=IBKR_MCP_MCP__HOST=127.0.0.1
 Environment=IBKR_MCP_MCP__PORT=8882

@@ -143,33 +143,38 @@ impl OrderManager {
             .map_err(|e| IbkrError::Unknown(format!("open orders read failed: {e}")))?;
 
         // One request, one round trip: the gateway answers `openOrder`s and then
-        // `openOrderEnd`, which closes the subscription (the library maps the
-        // marker to end-of-stream). A snapshot read is cheap; 10 s is generous
+        // `openOrderEnd`, which closes the subscription. That marker is the only
+        // end of the request a snapshot read may accept: upstream reports the
+        // same end-of-stream for the marker and for a subscription whose
+        // channel closed early (the discriminator it keeps, `ended_natively`,
+        // is `pub(crate)`), so folding the stream by hand would report a
+        // truncated read — not connected to the gateway's answer at all — as a
+        // possibly empty *successful* snapshot. That collapse is exactly what
+        // D4 exists to prevent. `collect_to_end_within` is v5.1.0's fail-closed
+        // primitive for a request whose partial result is not a result:
+        //
+        //   * end marker               -> `Ok(rows)`
+        //   * channel closed early     -> `Err(UnexpectedEndOfStream)`
+        //   * terminal error / notice  -> that error
+        //   * deadline passed          -> `Err(Timeout)`; rows read so far are dropped
+        //
+        // All but the first are errors here, so no failure mode can be
+        // mistaken for an empty book. 10 s is generous for one round trip
         // without stalling a dispatch-time precondition on a dead link.
-        let rows = tokio::time::timeout(
-            tokio::time::Duration::from_secs(OPEN_ORDERS_TIMEOUT_SECS),
-            async {
-                let mut rows: Vec<OpenOrderRow> = Vec::new();
-                while let Some(item) = subscription.next().await {
-                    match item {
-                        Ok(ibapi::subscriptions::SubscriptionItem::Data(message)) => {
-                            apply_orders_message(&mut rows, message);
-                        }
-                        Ok(ibapi::subscriptions::SubscriptionItem::Notice(n)) => {
-                            info!(notice = %n, "open orders subscription notice");
-                        }
-                        Err(e) => {
-                            return Err(IbkrError::Unknown(format!("open orders read failed: {e}")));
-                        }
-                    }
+        let items = subscription
+            .collect_to_end_within(tokio::time::Duration::from_secs(OPEN_ORDERS_TIMEOUT_SECS))
+            .await
+            .map_err(|e| match e {
+                ibapi::Error::Timeout => {
+                    IbkrError::Unknown("open orders: timed out waiting for the gateway".to_string())
                 }
-                Ok(rows)
-            },
-        )
-        .await
-        .map_err(|_| {
-            IbkrError::Unknown("open orders: timed out waiting for the gateway".to_string())
-        })??;
+                other => IbkrError::Unknown(format!("open orders read failed: {other}")),
+            })?;
+
+        let mut rows: Vec<OpenOrderRow> = Vec::new();
+        for message in items {
+            apply_orders_message(&mut rows, message);
+        }
 
         Ok(OpenOrdersRead {
             account_id: account_id.to_string(),
@@ -332,7 +337,7 @@ pub const OPEN_ORDERS_TIMEOUT_SECS: u64 = 10;
 ///
 /// Projected from IBKR's *all open orders* response, which covers orders
 /// created through the TWS API **regardless of which client id submitted
-/// them** — the residual case behind `t_e85f4f68` run 141, where the submitting
+/// them** — the residual case observed in run 141, where the submitting
 /// client no longer exists. Orders placed *manually* in TWS are not covered;
 /// that needs the master-client mechanism and is deliberately out of scope.
 ///
@@ -559,7 +564,7 @@ mod tests {
         order.order_id = 7001;
         order.client_id = 320;
         order.perm_id = 99887766;
-        order.account = "DUK271345".to_string();
+        order.account = "DUK000000".to_string();
         order.action = Action::Sell;
         order.total_quantity = 6.0;
         order.order_type = "LMT".to_string();
@@ -596,7 +601,7 @@ mod tests {
         assert_eq!(row.order_id, 7001);
         assert_eq!(row.perm_id, 99887766);
         assert_eq!(row.client_id, 320);
-        assert_eq!(row.account, "DUK271345");
+        assert_eq!(row.account, "DUK000000");
         assert_eq!(row.symbol, "AAPL");
         assert_eq!(row.con_id, 265598);
         assert_eq!(row.sec_type, "STK");
@@ -684,7 +689,7 @@ mod tests {
     #[test]
     fn the_account_filter_only_widens() {
         let mut rows = vec![OpenOrderRow {
-            account: "DUK271345".to_string(),
+            account: "DUK000000".to_string(),
             ..OpenOrderRow::empty()
         }];
         rows.push(OpenOrderRow {
@@ -692,13 +697,13 @@ mod tests {
             ..OpenOrderRow::empty()
         });
         rows.push(OpenOrderRow {
-            account: "U18197748".to_string(),
+            account: "U00000000".to_string(),
             ..OpenOrderRow::empty()
         });
 
-        let kept = filter_orders(rows, "DUK271345", "");
+        let kept = filter_orders(rows, "DUK000000", "");
         assert_eq!(kept.len(), 2, "the unreported-account row is kept, the live one dropped");
-        assert_eq!(kept[0].account, "DUK271345");
+        assert_eq!(kept[0].account, "DUK000000");
         assert_eq!(kept[1].account, "");
     }
 
@@ -737,14 +742,14 @@ mod tests {
         });
 
         let read = OpenOrdersRead {
-            account_id: "DUK271345".to_string(),
+            account_id: "DUK000000".to_string(),
             symbol: String::new(),
             orders: working_rows,
         };
         let payload = read.as_payload();
 
         assert_eq!(payload["success"], serde_json::json!(true));
-        assert_eq!(payload["accountId"], serde_json::json!("DUK271345"));
+        assert_eq!(payload["accountId"], serde_json::json!("DUK000000"));
         assert_eq!(payload["symbol"], serde_json::json!(""));
         assert_eq!(payload["count"], serde_json::json!(2));
         assert_eq!(payload["workingCount"], serde_json::json!(1));
@@ -776,3 +781,13 @@ mod tests {
         );
     }
 }
+
+/// Offline fault injection for the D4 read: a deterministic loopback fake
+/// gateway drives the production `open_orders` path through every way the
+/// stream can end (truncation, error, end marker, silence).
+///
+/// A module of its own, like `client::fault_matrix_phase0`: the qualification
+/// work must not touch the upstream `tests` module.
+#[cfg(test)]
+#[path = "orders_fault_injection.rs"]
+mod fault_injection;

@@ -34,7 +34,7 @@ StartLimitBurst=5
 Type=simple
 User=jiri
 Group=jiri
-WorkingDirectory=/home/jiri/dev/trading/ibkr-mcp-rs
+WorkingDirectory=/home/ibkr/ibkr-mcp-rs
 ExecStart=/usr/local/bin/ibkr-mcp-rs
 Environment=IBKR_MCP_MCP__HOST=127.0.0.1
 Environment=IBKR_MCP_MCP__PORT=8881
@@ -43,6 +43,12 @@ Environment=IBKR_MCP_IBKR__PORT=4001
 Environment=IBKR_MCP_IBKR__CLIENT_ID=204
 Environment=IBKR_MCP_IBKR__PAPER_TRADING=false
 Environment=IBKR_MCP_IBKR__READ_ONLY=false
+# Account-summary subscription policy: disable periodic cancel/reopen. IBKR does
+# not resend unchanged summary tags, and replacing the subscription can burn the
+# error-322 account-summary cap even after a locally confirmed cancel. One
+# long-lived subscription (refresh disabled) is the qualified policy; consumers
+# treat values as snapshot-age, never tick-fresh.
+Environment=IBKR_MCP_IBKR__ACCOUNT_REFRESH_SECS=0
 # Health/tool-authorization contract version (plan 6.1). Part of the qualified
 # tuple: it must equal health.contract_version in config/default.yaml and
 # health_contract_version in the artifact manifest, and the process reports it

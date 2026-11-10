@@ -1,6 +1,6 @@
 # PLAN — historical bars (IV history), scanners, WSH events
 
-Task: `t_08f72de1` — extend `ibkr-mcp-rs` with read-only historical/IV-rank/scanner/WSH-event tools, build, deploy.
+Task: extend `ibkr-mcp-rs` with read-only historical/IV-rank/scanner/WSH-event tools, build, deploy.
 Status: plan → implement → deploy in this run (scope pre-approved in-session).
 
 ## 1. Decisions (settled before code)
